@@ -1,5 +1,16 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
+let systemOpenCallback = null
+const pendingSystemOpenMessages = []
+
+ipcRenderer.on('pdf:open-from-system', (_event, message) => {
+  if (systemOpenCallback) {
+    systemOpenCallback(message)
+  } else {
+    pendingSystemOpenMessages.push(message)
+  }
+})
+
 contextBridge.exposeInMainWorld('electronAPI', {
   openPdf: () => ipcRenderer.invoke('pdf:open'),
   openDroppedPdf: (file) => ipcRenderer.invoke('pdf:open-dropped', webUtils.getPathForFile(file)),
@@ -26,4 +37,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('window:fullscreen-changed', (_event, fullscreen) => callback(fullscreen))
   },
   removeFullscreenListener: () => ipcRenderer.removeAllListeners('window:fullscreen-changed'),
+  onOpenPdfFromSystem: (callback) => {
+    systemOpenCallback = callback
+    for (const message of pendingSystemOpenMessages.splice(0)) {
+      callback(message)
+    }
+    return () => {
+      if (systemOpenCallback === callback) {
+        systemOpenCallback = null
+      }
+    }
+  },
+  notifyRendererReady: () => ipcRenderer.send('pdf:renderer-ready'),
 })

@@ -81,7 +81,10 @@
     "fileAssociations": [
       {
         "ext": "pdf",
-        "name": "PDF Document",
+        "name": "Next PDF Viewer PDF Document",
+        "description": "PDF Document",
+        "mimeType": "application/pdf",
+        "icon": "icon.ico",
         "role": "Viewer"
       }
     ],

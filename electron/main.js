@@ -5,9 +5,11 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const appDataRoot = app.isPackaged
-  ? path.join(app.getPath('appData'), 'Next PDF Viewer')
-  : path.join(process.cwd(), '.electron-data')
+const appDataRoot = process.env.NEXT_PDF_VIEWER_DATA_DIR
+  ? path.resolve(process.env.NEXT_PDF_VIEWER_DATA_DIR)
+  : app.isPackaged
+    ? path.join(app.getPath('appData'), 'Next PDF Viewer')
+    : path.join(process.cwd(), '.electron-data')
 
 app.setPath('userData', path.join(appDataRoot, 'user-data'))
 app.setPath('logs', path.join(appDataRoot, 'logs'))
@@ -21,6 +23,14 @@ app.commandLine.appendSwitch('password-store', 'basic')
 let mainWindow = null
 let storeCache = null
 let storeOperation = Promise.resolve()
+let rendererReady = false
+let processingSystemPdf = false
+const pendingSystemPdfPaths = []
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!hasSingleInstanceLock) {
+  app.quit()
+}
 
 function emptyStore() {
   return {
@@ -40,6 +50,101 @@ function emptyStore() {
 function getDocumentId(filePath) {
   const normalizedPath = process.platform === 'win32' ? filePath.toLowerCase() : filePath
   return createHash('sha256').update(normalizedPath).digest('hex')
+}
+
+function getPdfPathFromArguments(argumentsList, workingDirectory = process.cwd()) {
+  for (const argument of argumentsList) {
+    if (typeof argument !== 'string' || argument.startsWith('-')) {
+      continue
+    }
+
+    let candidate = argument.trim().replace(/^"|"$/g, '')
+    if (candidate.startsWith('file://')) {
+      try {
+        candidate = fileURLToPath(candidate)
+      } catch {
+        continue
+      }
+    }
+
+    if (path.extname(candidate).toLowerCase() !== '.pdf') {
+      continue
+    }
+
+    return path.isAbsolute(candidate)
+      ? path.normalize(candidate)
+      : path.resolve(workingDirectory, candidate)
+  }
+
+  return null
+}
+
+function enqueueSystemPdf(filePath) {
+  if (!filePath) {
+    return
+  }
+
+  pendingSystemPdfPaths.push(filePath)
+  void processPendingSystemPdfs()
+}
+
+async function processPendingSystemPdfs() {
+  if (
+    processingSystemPdf ||
+    !rendererReady ||
+    !mainWindow ||
+    mainWindow.isDestroyed()
+  ) {
+    return
+  }
+
+  processingSystemPdf = true
+  try {
+    while (
+      pendingSystemPdfPaths.length > 0 &&
+      rendererReady &&
+      mainWindow &&
+      !mainWindow.isDestroyed()
+    ) {
+      const filePath = pendingSystemPdfPaths.shift()
+      const targetWindow = mainWindow
+      targetWindow.webContents.send('pdf:open-from-system', { status: 'loading' })
+
+      try {
+        const pdf = await loadPdf(filePath)
+        if (!targetWindow.isDestroyed()) {
+          targetWindow.webContents.send('pdf:open-from-system', { status: 'success', pdf })
+        }
+      } catch (error) {
+        if (!targetWindow.isDestroyed()) {
+          targetWindow.webContents.send('pdf:open-from-system', {
+            status: 'error',
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+    }
+  } finally {
+    processingSystemPdf = false
+  }
+}
+
+async function showAndFocusMainWindow() {
+  if ((!mainWindow || mainWindow.isDestroyed()) && app.isReady()) {
+    await createWindow()
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore()
+  }
+  if (!mainWindow.isVisible()) {
+    mainWindow.show()
+  }
+  mainWindow.focus()
 }
 
 function getStorePath() {
@@ -230,6 +335,7 @@ async function persistWindowState(window) {
 }
 
 async function createWindow() {
+  rendererReady = false
   const savedWindowState = await withStore((store) => store.windowState)
   const hasVisiblePosition = isWindowPositionVisible(savedWindowState)
   const window = new BrowserWindow({
@@ -294,6 +400,7 @@ async function createWindow() {
     clearTimeout(saveTimeout)
     if (mainWindow === window) {
       mainWindow = null
+      rendererReady = false
     }
   })
 
@@ -316,6 +423,13 @@ ipcMain.handle('pdf:open', async () => {
   }
 
   return loadPdf(result.filePaths[0])
+})
+
+ipcMain.on('pdf:renderer-ready', (event) => {
+  if (mainWindow && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents) {
+    rendererReady = true
+    void processPendingSystemPdfs()
+  }
 })
 
 ipcMain.handle('pdf:open-dropped', (_event, filePath) => {
@@ -374,7 +488,9 @@ ipcMain.handle('pdf:save-state', (_event, id, state) =>
       return
     }
 
-    store.documentStates[id] = sanitizeReadingState(state)
+    const readingState = sanitizeReadingState(state)
+    console.debug('Saved page:', readingState.page)
+    store.documentStates[id] = readingState
     await saveStore(store)
   }),
 )
@@ -497,15 +613,37 @@ ipcMain.handle('window:exit-fullscreen', (event) => {
   return false
 })
 
-app.whenReady().then(async () => {
-  await createWindow()
+if (hasSingleInstanceLock) {
+  const startupPdfPath = getPdfPathFromArguments(process.argv)
+  if (startupPdfPath) {
+    pendingSystemPdfPaths.push(startupPdfPath)
+  }
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      void createWindow()
+  app.on('second-instance', (_event, commandLine, workingDirectory) => {
+    enqueueSystemPdf(getPdfPathFromArguments(commandLine, workingDirectory))
+    void showAndFocusMainWindow()
+  })
+
+  app.on('open-file', (event, filePath) => {
+    event.preventDefault()
+    if (path.extname(filePath).toLowerCase() === '.pdf') {
+      enqueueSystemPdf(path.normalize(filePath))
+      void showAndFocusMainWindow()
     }
   })
-})
+
+  app.whenReady().then(async () => {
+    await createWindow()
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        void createWindow()
+      } else {
+        void showAndFocusMainWindow()
+      }
+    })
+  })
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

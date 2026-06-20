@@ -14,6 +14,11 @@ type OpenedPdf = {
   readingState: PdfReadingState
 }
 
+type SystemPdfOpenMessage =
+  | { status: 'loading' }
+  | { status: 'success'; pdf: OpenedPdf }
+  | { status: 'error'; error: string }
+
 declare global {
   interface Window {
     electronAPI: {
@@ -46,6 +51,10 @@ declare global {
       exitFullscreen: () => Promise<boolean>
       onFullscreenChange: (callback: (fullscreen: boolean) => void) => void
       removeFullscreenListener: () => void
+      onOpenPdfFromSystem: (
+        callback: (message: SystemPdfOpenMessage) => void,
+      ) => () => void
+      notifyRendererReady: () => void
     }
   }
 }

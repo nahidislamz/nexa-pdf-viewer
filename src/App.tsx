@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { Document, Page, Thumbnail, pdfjs } from 'react-pdf'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import 'react-pdf/dist/Page/TextLayer.css'
@@ -25,6 +25,11 @@ type OpenedPdf = PdfFile & {
     rotation: number
   }
 }
+
+type SystemPdfOpenMessage =
+  | { status: 'loading' }
+  | { status: 'success'; pdf: OpenedPdf }
+  | { status: 'error'; error: string }
 
 type RecentFile = {
   id: string
@@ -98,13 +103,15 @@ function App() {
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>([])
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null)
   const [numPages, setNumPages] = useState(0)
-  const [scale, setScale] = useState(1)
+  const [displayZoom, setDisplayZoom] = useState(1)
+  const [renderZoom, setRenderZoom] = useState(1)
   const [zoomMode, setZoomMode] = useState<'manual' | 'fit-width'>('manual')
   const [viewerWidth, setViewerWidth] = useState(0)
   const [firstPageWidth, setFirstPageWidth] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
   const [pageInput, setPageInput] = useState('1')
   const [isLoading, setIsLoading] = useState(false)
+  const [isRestoring, setIsRestoring] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -137,11 +144,14 @@ function App() {
   const pageInputFocusedRef = useRef(false)
   const currentPageRef = useRef(1)
   const zoomAnchorRef = useRef<{ pageNumber: number; relativeOffset: number } | null>(null)
+  const zoomDebounceRef = useRef(0)
+  const isRestoringZoomPositionRef = useRef(false)
   const pendingRestorePageRef = useRef<number | null>(null)
   const restoringReadingStateRef = useRef(false)
   const recentFilesRef = useRef<HTMLDetailsElement>(null)
-  const displayScaleRef = useRef(1)
+  const displayZoomRef = useRef(1)
   const wheelDeltaRef = useRef(0)
+  const wheelZoomFrameRef = useRef(0)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const searchGenerationRef = useRef(0)
   const pageTextCacheRef = useRef(new Map<number, CachedPageText>())
@@ -157,12 +167,11 @@ function App() {
   const pageNavigationGenerationRef = useRef(0)
   const pageScrollFrameRef = useRef(0)
 
-  const fitWidthScale = clampScale(
-    viewerWidth > 0 && firstPageWidth > 0 ? viewerWidth / firstPageWidth : scale,
+  const fitWidthZoom = clampScale(
+    viewerWidth > 0 && firstPageWidth > 0 ? viewerWidth / firstPageWidth : displayZoom,
   )
-  const displayScale = zoomMode === 'fit-width' ? fitWidthScale : scale
   const observedSinglePage = viewMode === 'single' ? currentPage : 0
-  displayScaleRef.current = displayScale
+  displayZoomRef.current = displayZoom
   viewModeRef.current = viewMode
   const matchesByPage = useMemo(() => {
     const groupedMatches = new Map<number, SearchMatch[]>()
@@ -207,6 +216,51 @@ function App() {
     [matchesByPage],
   )
 
+  const handleSystemPdfOpen = useEffectEvent((message: SystemPdfOpenMessage) => {
+    if (message.status === 'loading') {
+      setErrorMessage(null)
+      setIsLoading(true)
+      return
+    }
+
+    if (message.status === 'error') {
+      setIsLoading(false)
+      setErrorMessage(`Failed to open PDF: ${message.error}`)
+      return
+    }
+
+    loadOpenedPdf(message.pdf)
+    void refreshRecentFiles()
+  })
+
+  useEffect(() => {
+    if (zoomMode !== 'fit-width' || Math.abs(fitWidthZoom - displayZoom) < 0.001) {
+      return
+    }
+
+    const animationFrame = window.requestAnimationFrame(() => {
+      captureZoomAnchor()
+      isRestoringZoomPositionRef.current = true
+      displayZoomRef.current = fitWidthZoom
+      setDisplayZoom(fitWidthZoom)
+    })
+    return () => window.cancelAnimationFrame(animationFrame)
+  }, [displayZoom, fitWidthZoom, zoomMode])
+
+  useEffect(() => {
+    window.clearTimeout(zoomDebounceRef.current)
+    if (Math.abs(displayZoom - renderZoom) < 0.001) {
+      return
+    }
+
+    isRestoringZoomPositionRef.current = true
+    zoomDebounceRef.current = window.setTimeout(() => {
+      setRenderZoom(displayZoom)
+    }, 100)
+
+    return () => window.clearTimeout(zoomDebounceRef.current)
+  }, [displayZoom, renderZoom])
+
   useEffect(() => {
     void refreshRecentFiles()
     void window.electronAPI
@@ -228,6 +282,15 @@ function App() {
         setThumbnailSidebarOpen(!collapsed)
       })
       .catch((error) => setErrorMessage(getErrorMessage(error)))
+  }, [])
+
+  useEffect(() => {
+    const removeSystemOpenListener = window.electronAPI.onOpenPdfFromSystem(
+      handleSystemPdfOpen,
+    )
+
+    window.electronAPI.notifyRendererReady()
+    return removeSystemOpenListener
   }, [])
 
   useEffect(() => {
@@ -307,7 +370,9 @@ function App() {
   useEffect(
     () => () => {
       window.clearTimeout(navigationTimeoutRef.current)
+      window.clearTimeout(zoomDebounceRef.current)
       window.cancelAnimationFrame(pageScrollFrameRef.current)
+      window.cancelAnimationFrame(wheelZoomFrameRef.current)
     },
     [],
   )
@@ -532,40 +597,54 @@ function App() {
     )
 
     if (!anchor || !page) {
+      isRestoringZoomPositionRef.current = false
       return
     }
 
     const zoomAnchor = anchor
     const anchoredPage = page
 
-    function restorePosition() {
-      const bounds = anchoredPage.getBoundingClientRect()
-      const viewportTop = headerRef.current?.offsetHeight ?? 0
-      const desiredPageTop = viewportTop - zoomAnchor.relativeOffset * bounds.height
-      window.scrollBy({ top: bounds.top - desiredPageTop, behavior: 'auto' })
+    let restoreFrame = 0
+    let finishFrame = 0
+    function restorePosition(finish = false) {
+      window.cancelAnimationFrame(restoreFrame)
+      restoreFrame = window.requestAnimationFrame(() => {
+        const bounds = anchoredPage.getBoundingClientRect()
+        const viewportTop = headerRef.current?.offsetHeight ?? 0
+        const desiredPageTop = viewportTop - zoomAnchor.relativeOffset * bounds.height
+        window.scrollBy({ top: bounds.top - desiredPageTop, behavior: 'auto' })
+
+        if (finish) {
+          finishFrame = window.requestAnimationFrame(() => {
+            zoomAnchorRef.current = null
+            isRestoringZoomPositionRef.current = false
+          })
+        }
+      })
     }
 
-    const resizeObserver = new ResizeObserver(restorePosition)
-    const animationFrame = window.requestAnimationFrame(restorePosition)
+    const resizeObserver = new ResizeObserver(() => restorePosition())
+    restorePosition()
     const timeout = window.setTimeout(() => {
-      restorePosition()
+      restorePosition(true)
       resizeObserver.disconnect()
-      zoomAnchorRef.current = null
     }, 300)
 
     resizeObserver.observe(anchoredPage)
     return () => {
       resizeObserver.disconnect()
-      window.cancelAnimationFrame(animationFrame)
+      window.cancelAnimationFrame(restoreFrame)
+      window.cancelAnimationFrame(finishFrame)
       window.clearTimeout(timeout)
     }
-  }, [displayScale, isFullscreen, rotation, viewMode])
+  }, [isFullscreen, renderZoom, rotation, viewMode])
 
   useEffect(() => {
     const requestedPage = pendingRestorePageRef.current
     const viewer = viewerRef.current
 
     if (
+      !isRestoring ||
       requestedPage === null ||
       !viewer ||
       numPages === 0 ||
@@ -575,62 +654,149 @@ function App() {
     }
 
     const pageNumber = Math.min(numPages, Math.max(1, requestedPage))
-    const page = viewer.querySelector<HTMLElement>(`[data-page-number="${pageNumber}"]`)
-    if (!page) {
+    const targetPage = pageRefs.current.get(pageNumber)
+    const pageList = targetPage?.parentElement
+    if (!targetPage || !pageList) {
       return
     }
+    const restoredPage = targetPage
+    const restoredPageList = pageList
 
-    const targetPage = page
-    let restored = false
-    function restoreReadingPosition(force = false) {
-      const pageIsRendered = targetPage.querySelector('canvas') !== null
-      if (restored || (!force && !pageIsRendered)) {
+    let animationFrame = 0
+    let settleTimeout = 0
+    let restoredLogged = false
+    let finishing = false
+    let finished = false
+
+    function pagesThroughTargetAreRendered() {
+      if (viewModeRef.current === 'single') {
+        return restoredPage.querySelector('.react-pdf__Page__canvas') !== null
+      }
+
+      for (let candidatePage = 1; candidatePage <= pageNumber; candidatePage += 1) {
+        const page = pageRefs.current.get(candidatePage)
+        if (!page?.querySelector('.react-pdf__Page__canvas')) {
+          return false
+        }
+      }
+      return true
+    }
+
+    function scrollToRestoredPage() {
+      const headerHeight = headerRef.current?.offsetHeight ?? 0
+      window.scrollTo({
+        top: window.scrollY + restoredPage.getBoundingClientRect().top - headerHeight - 16,
+        behavior: 'auto',
+      })
+      currentPageRef.current = pageNumber
+      setCurrentPage(pageNumber)
+      setPageInput(String(pageNumber))
+      if (!restoredLogged) {
+        console.debug('Restored page:', pageNumber)
+        restoredLogged = true
+      }
+    }
+
+    function getActualVisiblePage() {
+      const viewportTop = headerRef.current?.offsetHeight ?? 0
+      let actualPage = pageNumber
+      let largestVisibleHeight = -1
+
+      for (const [candidatePage, page] of pageRefs.current) {
+        const bounds = page.getBoundingClientRect()
+        const visibleHeight = Math.max(
+          0,
+          Math.min(bounds.bottom, window.innerHeight) - Math.max(bounds.top, viewportTop),
+        )
+        if (visibleHeight > largestVisibleHeight) {
+          largestVisibleHeight = visibleHeight
+          actualPage = candidatePage
+        }
+      }
+
+      return actualPage
+    }
+
+    function finishRestoration() {
+      if (finished || finishing) {
         return
       }
 
-      restored = true
-      resizeObserver.disconnect()
-      mutationObserver.disconnect()
-      window.clearTimeout(fallbackTimeout)
-      window.requestAnimationFrame(() => {
-        const headerHeight = headerRef.current?.offsetHeight ?? 0
-        currentPageRef.current = pageNumber
-        setCurrentPage(pageNumber)
-        setPageInput(String(pageNumber))
-        window.scrollTo({
-          top: window.scrollY + targetPage.getBoundingClientRect().top - headerHeight - 16,
-          behavior: 'auto',
-        })
-        window.requestAnimationFrame(() => {
+      finishing = true
+      scrollToRestoredPage()
+      animationFrame = window.requestAnimationFrame(() => {
+        scrollToRestoredPage()
+        animationFrame = window.requestAnimationFrame(() => {
+          const actualPage = getActualVisiblePage()
+          console.debug('Actual page after restore:', actualPage)
+          currentPageRef.current = pageNumber
+          setCurrentPage(pageNumber)
+          setPageInput(String(pageNumber))
           pendingRestorePageRef.current = null
           restoringReadingStateRef.current = false
+          finished = true
+          setIsRestoring(false)
         })
       })
     }
 
-    const resizeObserver = new ResizeObserver(() => restoreReadingPosition())
-    const mutationObserver = new MutationObserver(() => restoreReadingPosition())
-    const fallbackTimeout = window.setTimeout(() => restoreReadingPosition(true), 1500)
-    resizeObserver.observe(targetPage)
-    mutationObserver.observe(targetPage, { childList: true, subtree: true })
-    restoreReadingPosition()
+    function scheduleRestoration() {
+      if (finished || finishing) {
+        return
+      }
+
+      window.cancelAnimationFrame(animationFrame)
+      window.clearTimeout(settleTimeout)
+      if (!pagesThroughTargetAreRendered()) {
+        return
+      }
+
+      animationFrame = window.requestAnimationFrame(() => {
+        scrollToRestoredPage()
+        settleTimeout = window.setTimeout(finishRestoration, 300)
+      })
+    }
+
+    const resizeObserver = new ResizeObserver(scheduleRestoration)
+    const mutationObserver = new MutationObserver(scheduleRestoration)
+    const fallbackTimeout = window.setTimeout(finishRestoration, 30000)
+    resizeObserver.observe(restoredPageList)
+    mutationObserver.observe(restoredPageList, {
+      attributes: true,
+      childList: true,
+      subtree: true,
+    })
+    scheduleRestoration()
+
     return () => {
       resizeObserver.disconnect()
       mutationObserver.disconnect()
+      window.cancelAnimationFrame(animationFrame)
+      window.clearTimeout(settleTimeout)
       window.clearTimeout(fallbackTimeout)
     }
-  }, [firstPageWidth, numPages, zoomMode])
+  }, [firstPageWidth, isRestoring, numPages, renderZoom, rotation, zoomMode])
 
   useEffect(() => {
-    if (!activeDocumentId || numPages === 0 || restoringReadingStateRef.current) {
+    if (
+      !activeDocumentId ||
+      numPages === 0 ||
+      isRestoring ||
+      restoringReadingStateRef.current
+    ) {
       return
     }
 
     const timeout = window.setTimeout(() => {
+      if (restoringReadingStateRef.current) {
+        return
+      }
+
+      console.debug('Saved page:', currentPage)
       void window.electronAPI
         .savePdfState(activeDocumentId, {
           page: currentPage,
-          zoom: displayScale,
+          zoom: displayZoom,
           fitMode: zoomMode === 'fit-width',
           rotation,
         })
@@ -638,12 +804,12 @@ function App() {
     }, 250)
 
     return () => window.clearTimeout(timeout)
-  }, [activeDocumentId, currentPage, displayScale, numPages, rotation, zoomMode])
+  }, [activeDocumentId, currentPage, displayZoom, isRestoring, numPages, rotation, zoomMode])
 
   useEffect(() => {
     const viewer = viewerRef.current
 
-    if (!viewer || numPages === 0) {
+    if (!viewer || numPages === 0 || isRestoring) {
       return
     }
 
@@ -652,6 +818,10 @@ function App() {
 
     function updateCurrentPage() {
       animationFrame = 0
+      if (restoringReadingStateRef.current || isRestoringZoomPositionRef.current) {
+        return
+      }
+
       const viewportTop = headerRef.current?.offsetHeight ?? 0
       let mostVisiblePage = 0
       let largestVisibleHeight = 0
@@ -722,7 +892,7 @@ function App() {
       window.removeEventListener('resize', scheduleCurrentPageUpdate)
       window.cancelAnimationFrame(animationFrame)
     }
-  }, [numPages, observedSinglePage, viewMode])
+  }, [isRestoring, numPages, observedSinglePage, viewMode])
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -777,13 +947,13 @@ function App() {
       if (event.ctrlKey && numPages > 0) {
         if (event.key === '+' || event.key === '=' || event.code === 'NumpadAdd') {
           event.preventDefault()
-          changeZoom(displayScale + 0.25)
+          changeZoom(displayZoomRef.current + 0.25)
           return
         }
 
         if (event.key === '-' || event.code === 'NumpadSubtract') {
           event.preventDefault()
-          changeZoom(displayScale - 0.25)
+          changeZoom(displayZoomRef.current - 0.25)
           return
         }
 
@@ -848,15 +1018,24 @@ function App() {
         return
       }
 
-      const zoomStep = wheelDeltaRef.current < 0 ? 0.1 : -0.1
-      wheelDeltaRef.current = 0
-      const nextScale = clampScale(displayScaleRef.current + zoomStep)
-      displayScaleRef.current = nextScale
-      changeZoom(nextScale)
+      if (wheelZoomFrameRef.current !== 0) {
+        return
+      }
+
+      wheelZoomFrameRef.current = window.requestAnimationFrame(() => {
+        wheelZoomFrameRef.current = 0
+        const zoomStep = wheelDeltaRef.current < 0 ? 0.1 : -0.1
+        wheelDeltaRef.current = 0
+        changeZoom(displayZoomRef.current + zoomStep)
+      })
     }
 
     window.addEventListener('wheel', handleWheel, { passive: false })
-    return () => window.removeEventListener('wheel', handleWheel)
+    return () => {
+      window.removeEventListener('wheel', handleWheel)
+      window.cancelAnimationFrame(wheelZoomFrameRef.current)
+      wheelZoomFrameRef.current = 0
+    }
   })
 
   function captureZoomAnchor() {
@@ -883,12 +1062,14 @@ function App() {
 
   function changeZoom(nextScale: number) {
     const normalizedScale = clampScale(nextScale)
-    if (normalizedScale === displayScale && zoomMode === 'manual') {
+    if (normalizedScale === displayZoomRef.current && zoomMode === 'manual') {
       return
     }
 
     captureZoomAnchor()
-    setScale(normalizedScale)
+    isRestoringZoomPositionRef.current = true
+    displayZoomRef.current = normalizedScale
+    setDisplayZoom(normalizedScale)
     setZoomMode('manual')
   }
 
@@ -897,25 +1078,40 @@ function App() {
       return
     }
 
+    if (
+      Math.abs(fitWidthZoom - displayZoomRef.current) < 0.001 &&
+      Math.abs(fitWidthZoom - renderZoom) < 0.001
+    ) {
+      setZoomMode('fit-width')
+      return
+    }
+
     captureZoomAnchor()
+    isRestoringZoomPositionRef.current = true
     setZoomMode('fit-width')
   }
 
   async function toggleFullscreen() {
     captureZoomAnchor()
+    isRestoringZoomPositionRef.current = true
     try {
       setIsFullscreen(await window.electronAPI.toggleFullscreen())
     } catch (error) {
+      zoomAnchorRef.current = null
+      isRestoringZoomPositionRef.current = false
       setErrorMessage(`Fullscreen failed: ${getErrorMessage(error)}`)
     }
   }
 
   async function exitFullscreen() {
     captureZoomAnchor()
+    isRestoringZoomPositionRef.current = true
     try {
       await window.electronAPI.exitFullscreen()
       setIsFullscreen(false)
     } catch (error) {
+      zoomAnchorRef.current = null
+      isRestoringZoomPositionRef.current = false
       setErrorMessage(`Could not exit fullscreen: ${getErrorMessage(error)}`)
     }
   }
@@ -976,6 +1172,7 @@ function App() {
 
   function toggleViewMode() {
     captureZoomAnchor()
+    isRestoringZoomPositionRef.current = true
     const nextViewMode: ViewMode = viewMode === 'continuous' ? 'single' : 'continuous'
     setViewMode(nextViewMode)
     void window.electronAPI
@@ -1136,6 +1333,7 @@ function App() {
 
   function rotatePages(delta: -90 | 90) {
     captureZoomAnchor()
+    isRestoringZoomPositionRef.current = true
     const nextRotation = normalizeRotation(rotation + delta)
     const firstPage = firstPageProxyRef.current
     if (firstPage) {
@@ -1194,7 +1392,7 @@ function App() {
 
       const page = await pdfDocument.getPage(pageNumber)
       const viewport = page.getViewport({
-        scale: displayScale,
+        scale: renderZoom,
         rotation: normalizeRotation(page.rotate + rotation),
       })
       const [, destinationY] = viewport.convertToViewportPoint(0, destinationTop)
@@ -1331,9 +1529,13 @@ function App() {
 
   function loadOpenedPdf(result: OpenedPdf) {
     const readingState = result.readingState
+    const restoredZoom = clampScale(readingState.zoom)
     restoringReadingStateRef.current = true
+    setIsRestoring(true)
+    isRestoringZoomPositionRef.current = false
     navigationTargetRef.current = null
     window.clearTimeout(navigationTimeoutRef.current)
+    window.clearTimeout(zoomDebounceRef.current)
     pendingRestorePageRef.current = readingState.page
     zoomAnchorRef.current = null
     pageTextCacheRef.current.clear()
@@ -1348,7 +1550,9 @@ function App() {
     setPdfDocument(null)
     closeSearch()
     setActiveDocumentId(result.id)
-    setScale(clampScale(readingState.zoom))
+    displayZoomRef.current = restoredZoom
+    setDisplayZoom(restoredZoom)
+    setRenderZoom(restoredZoom)
     setZoomMode(readingState.fitMode ? 'fit-width' : 'manual')
     setRotation(normalizeRotation(readingState.rotation))
     setPdfFile({
@@ -1530,23 +1734,23 @@ function App() {
             type="button"
             aria-label="Zoom out"
             title="Zoom out"
-            onClick={() => changeZoom(displayScale - 0.25)}
-            disabled={displayScale <= MIN_SCALE}
+            onClick={() => changeZoom(displayZoomRef.current - 0.25)}
+            disabled={displayZoom <= MIN_SCALE}
             className="grid size-10 place-items-center rounded-lg border border-slate-700 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <ZoomOutIcon />
           </button>
 
           <span className="flex h-10 min-w-16 items-center justify-center text-center text-sm">
-            {Math.round(displayScale * 100)}%
+            {Math.round(displayZoom * 100)}%
           </span>
 
           <button
             type="button"
             aria-label="Zoom in"
             title="Zoom in"
-            onClick={() => changeZoom(displayScale + 0.25)}
-            disabled={displayScale >= MAX_SCALE}
+            onClick={() => changeZoom(displayZoomRef.current + 0.25)}
+            disabled={displayZoom >= MAX_SCALE}
             className="grid size-10 place-items-center rounded-lg border border-slate-700 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <ZoomInIcon />
@@ -1984,20 +2188,24 @@ function App() {
                       void loadPdfOutline(loadedDocument)
                       void loadDocumentMetadata(loadedDocument)
                       pendingRestorePageRef.current = restoredPage
-                      if (viewModeRef.current === 'single') {
-                        currentPageRef.current = restoredPage
-                        setCurrentPage(restoredPage)
-                        setPageInput(String(restoredPage))
-                      }
+                      currentPageRef.current = restoredPage
+                      setCurrentPage(restoredPage)
+                      setPageInput(String(restoredPage))
                       setNumPages(loadedPages)
                       setIsLoading(false)
                       setErrorMessage(null)
                     }}
                     onLoadError={(error) => {
+                      pendingRestorePageRef.current = null
+                      restoringReadingStateRef.current = false
+                      setIsRestoring(false)
                       setIsLoading(false)
                       setErrorMessage(getErrorMessage(error))
                     }}
                     onSourceError={(error) => {
+                      pendingRestorePageRef.current = null
+                      restoringReadingStateRef.current = false
+                      setIsRestoring(false)
                       setIsLoading(false)
                       setErrorMessage(getErrorMessage(error))
                     }}
@@ -2021,7 +2229,7 @@ function App() {
                         >
                           <RotatedPage
                             pageNumber={pageNumber}
-                            scale={displayScale}
+                            scale={renderZoom}
                             rotation={rotation}
                             customTextRenderer={
                               searchMatches.length > 0 ? renderSearchText : undefined
@@ -2060,7 +2268,7 @@ function App() {
           <>
             <StatusItem>Page {currentPage} of {numPages || 0}</StatusItem>
             <StatusDivider />
-            <StatusItem>{Math.round(displayScale * 100)}%</StatusItem>
+            <StatusItem>{Math.round(displayZoom * 100)}%</StatusItem>
             <StatusDivider />
             <StatusItem>{zoomMode === 'fit-width' ? 'Fit Width' : 'Manual Zoom'}</StatusItem>
             <StatusDivider />
