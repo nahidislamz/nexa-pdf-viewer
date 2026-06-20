@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #0f172a;
+  overflow-x: hidden;
+}
+
+button,
+summary,
+select,
+input {
+  transition-duration: 180ms;
+  transition-property: color, background-color, border-color, box-shadow, opacity, transform;
+}
+
+button:focus-visible,
+summary:focus-visible,
+select:focus-visible,
+input:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+
+* {
+  scrollbar-color: #475569 #111827;
+  scrollbar-width: thin;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #111827;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid #111827;
+  border-radius: 999px;
+  background: #475569;
+}
+
+.react-pdf__Page {
+  box-shadow:
+    0 12px 28px rgb(0 0 0 / 34%),
+    0 2px 8px rgb(0 0 0 / 18%);
+}
+
+.react-pdf__Page canvas {
+  border-radius: 3px;
+}
+
+.pdf-search-match {
+  border-radius: 2px;
+  background: rgb(250 204 21 / 75%);
+  color: transparent;
+}
+
+.pdf-search-match.pdf-search-selected {
+  background: rgb(249 115 22 / 90%);
+  outline: 2px solid rgb(255 255 255 / 90%);
+  outline-offset: 1px;
+}
+
+.viewer-background-select {
+  color-scheme: dark;
+  background-color: #020617;
+  color: #f1f5f9;
+}
+
+.viewer-background-select option {
+  background-color: #0f172a;
+  color: #f8fafc;
+}
