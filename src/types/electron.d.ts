@@ -55,6 +55,17 @@ declare global {
         callback: (message: SystemPdfOpenMessage) => void,
       ) => () => void
       notifyRendererReady: () => void
+      getMemoryUsage: () => Promise<{
+        mainWorkingSetMb: number
+        totalWorkingSetMb: number
+        totalPrivateMb: number
+        processes: Array<{
+          type: string
+          workingSetMb: number
+          peakWorkingSetMb: number
+          privateMb: number
+        }>
+      }>
     }
   }
 }

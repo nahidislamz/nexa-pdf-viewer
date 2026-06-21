@@ -234,7 +234,11 @@ function sanitizeWindowState(state) {
 }
 
 async function loadPdf(filePath) {
+  const started = performance.now()
   const buffer = await fs.readFile(filePath)
+  console.info(
+    `PDF file read time: ${Math.round(performance.now() - started)}ms (${Math.round(buffer.byteLength / 1024 / 1024)}MB)`,
+  )
   const id = getDocumentId(filePath)
   const name = path.basename(filePath)
 
@@ -611,6 +615,23 @@ ipcMain.handle('window:exit-fullscreen', (event) => {
     window.setFullScreen(false)
   }
   return false
+})
+
+ipcMain.handle('performance:get-memory', async () => {
+  const mainProcessMemory = await process.getProcessMemoryInfo()
+  const processes = app.getAppMetrics().map((metric) => ({
+    type: metric.type,
+    workingSetMb: Math.round(metric.memory.workingSetSize / 1024),
+    peakWorkingSetMb: Math.round(metric.memory.peakWorkingSetSize / 1024),
+    privateMb: Math.round(metric.memory.privateBytes / 1024),
+  }))
+
+  return {
+    mainWorkingSetMb: Math.round(mainProcessMemory.residentSet / 1024),
+    totalWorkingSetMb: processes.reduce((total, metric) => total + metric.workingSetMb, 0),
+    totalPrivateMb: processes.reduce((total, metric) => total + metric.privateMb, 0),
+    processes,
+  }
 })
 
 if (hasSingleInstanceLock) {

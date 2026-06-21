@@ -69,8 +69,17 @@ type DocumentMetadata = {
   modificationDate: string
 }
 
+type SearchProgress = {
+  processed: number
+  total: number
+}
+
 const MIN_SCALE = 0.25
 const MAX_SCALE = 4
+const ZOOM_RENDER_DEBOUNCE_MS = 120
+const PAGE_RENDER_OVERSCAN = 1
+const DEFAULT_PAGE_WIDTH = 612
+const DEFAULT_PAGE_HEIGHT = 792
 const VIEWER_BACKGROUNDS: Record<ViewerBackground, string> = {
   'dark-gray': '#1f2937',
   black: '#000000',
@@ -105,12 +114,15 @@ function App() {
   const [numPages, setNumPages] = useState(0)
   const [displayZoom, setDisplayZoom] = useState(1)
   const [renderZoom, setRenderZoom] = useState(1)
+  const [isZooming, setIsZooming] = useState(false)
   const [zoomMode, setZoomMode] = useState<'manual' | 'fit-width'>('manual')
   const [viewerWidth, setViewerWidth] = useState(0)
   const [firstPageWidth, setFirstPageWidth] = useState(0)
+  const [firstPageHeight, setFirstPageHeight] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
   const [pageInput, setPageInput] = useState('1')
   const [isLoading, setIsLoading] = useState(false)
+  const [loadingProgress, setLoadingProgress] = useState<string | null>(null)
   const [isRestoring, setIsRestoring] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
@@ -118,12 +130,16 @@ function App() {
   const [searchMatches, setSearchMatches] = useState<SearchMatch[]>([])
   const [selectedMatchIndex, setSelectedMatchIndex] = useState(-1)
   const [isSearching, setIsSearching] = useState(false)
+  const [searchProgress, setSearchProgress] = useState<SearchProgress | null>(null)
   const [thumbnailSidebarOpen, setThumbnailSidebarOpen] = useState(true)
   const [sidebarWidth, setSidebarWidth] = useState(280)
   const [sidebarResizing, setSidebarResizing] = useState(false)
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('thumbnails')
   const [visibleThumbnailPages, setVisibleThumbnailPages] = useState<Set<number>>(
     () => new Set(),
+  )
+  const [renderedPageNumbers, setRenderedPageNumbers] = useState<Set<number>>(
+    () => new Set([1]),
   )
   const [outline, setOutline] = useState<PdfOutlineItem[]>([])
   const [outlineLoading, setOutlineLoading] = useState(false)
@@ -143,22 +159,30 @@ function App() {
   const viewerRef = useRef<HTMLDivElement>(null)
   const pageInputFocusedRef = useRef(false)
   const currentPageRef = useRef(1)
-  const zoomAnchorRef = useRef<{ pageNumber: number; relativeOffset: number } | null>(null)
+  const zoomAnchorRef = useRef<{
+    pageNumber: number
+    relativeOffset: number
+    topMargin: number
+  } | null>(null)
   const zoomDebounceRef = useRef(0)
+  const zoomSnapshotTimeoutRef = useRef(0)
   const isRestoringZoomPositionRef = useRef(false)
   const pendingRestorePageRef = useRef<number | null>(null)
   const restoringReadingStateRef = useRef(false)
   const recentFilesRef = useRef<HTMLDetailsElement>(null)
   const displayZoomRef = useRef(1)
+  const renderZoomRef = useRef(1)
   const wheelDeltaRef = useRef(0)
   const wheelZoomFrameRef = useRef(0)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const searchGenerationRef = useRef(0)
   const pageTextCacheRef = useRef(new Map<number, CachedPageText>())
+  const nearbyPageNumbersRef = useRef(new Set<number>())
   const thumbnailListRef = useRef<HTMLDivElement>(null)
   const outlineGenerationRef = useRef(0)
   const metadataGenerationRef = useRef(0)
   const firstPageProxyRef = useRef<PDFPageProxy | null>(null)
+  const pdfDocumentRef = useRef<PDFDocumentProxy | null>(null)
   const navigationTargetRef = useRef<number | null>(null)
   const navigationTimeoutRef = useRef(0)
   const dragDepthRef = useRef(0)
@@ -166,12 +190,19 @@ function App() {
   const pageRefs = useRef(new Map<number, HTMLDivElement>())
   const pageNavigationGenerationRef = useRef(0)
   const pageScrollFrameRef = useRef(0)
+  const documentLoadStartedRef = useRef(0)
+  const initialPageRenderedRef = useRef(false)
+  const backgroundDocumentTaskRef = useRef(0)
 
   const fitWidthZoom = clampScale(
     viewerWidth > 0 && firstPageWidth > 0 ? viewerWidth / firstPageWidth : displayZoom,
   )
   const observedSinglePage = viewMode === 'single' ? currentPage : 0
+  const estimatedPageWidth = firstPageWidth || DEFAULT_PAGE_WIDTH
+  const estimatedPageHeight = firstPageHeight || DEFAULT_PAGE_HEIGHT
+  const zoomPreviewScale = renderZoom > 0 ? displayZoom / renderZoom : 1
   displayZoomRef.current = displayZoom
+  renderZoomRef.current = renderZoom
   viewModeRef.current = viewMode
   const matchesByPage = useMemo(() => {
     const groupedMatches = new Map<number, SearchMatch[]>()
@@ -220,11 +251,13 @@ function App() {
     if (message.status === 'loading') {
       setErrorMessage(null)
       setIsLoading(true)
+      setLoadingProgress('Reading PDF file...')
       return
     }
 
     if (message.status === 'error') {
       setIsLoading(false)
+      setLoadingProgress(null)
       setErrorMessage(`Failed to open PDF: ${message.error}`)
       return
     }
@@ -241,6 +274,7 @@ function App() {
     const animationFrame = window.requestAnimationFrame(() => {
       captureZoomAnchor()
       isRestoringZoomPositionRef.current = true
+      setIsZooming(true)
       displayZoomRef.current = fitWidthZoom
       setDisplayZoom(fitWidthZoom)
     })
@@ -253,12 +287,38 @@ function App() {
       return
     }
 
-    isRestoringZoomPositionRef.current = true
     zoomDebounceRef.current = window.setTimeout(() => {
+      preserveRenderedPagesForZoom()
+      setIsZooming(false)
+      renderZoomRef.current = displayZoom
       setRenderZoom(displayZoom)
-    }, 100)
+      window.clearTimeout(zoomSnapshotTimeoutRef.current)
+      zoomSnapshotTimeoutRef.current = window.setTimeout(clearZoomSnapshots, 3000)
+    }, ZOOM_RENDER_DEBOUNCE_MS)
 
     return () => window.clearTimeout(zoomDebounceRef.current)
+  }, [displayZoom, renderZoom])
+
+  useEffect(() => {
+    if (Math.abs(displayZoom - renderZoom) < 0.001) {
+      return
+    }
+
+    const anchor = zoomAnchorRef.current
+    const page = anchor ? pageRefs.current.get(anchor.pageNumber) : null
+    if (!anchor || !page) {
+      return
+    }
+
+    const animationFrame = window.requestAnimationFrame(() => {
+      const bounds = page.getBoundingClientRect()
+      const viewportTop = headerRef.current?.offsetHeight ?? 0
+      const desiredPageTop =
+        viewportTop + anchor.topMargin - anchor.relativeOffset * bounds.height
+      window.scrollBy({ top: bounds.top - desiredPageTop, behavior: 'auto' })
+    })
+
+    return () => window.cancelAnimationFrame(animationFrame)
   }, [displayZoom, renderZoom])
 
   useEffect(() => {
@@ -371,6 +431,8 @@ function App() {
     () => () => {
       window.clearTimeout(navigationTimeoutRef.current)
       window.clearTimeout(zoomDebounceRef.current)
+      window.clearTimeout(zoomSnapshotTimeoutRef.current)
+      window.clearTimeout(backgroundDocumentTaskRef.current)
       window.cancelAnimationFrame(pageScrollFrameRef.current)
       window.cancelAnimationFrame(wheelZoomFrameRef.current)
     },
@@ -455,6 +517,46 @@ function App() {
   }, [numPages, pdfDocument, sidebarTab, thumbnailSidebarOpen])
 
   useEffect(() => {
+    const viewer = viewerRef.current
+    if (!viewer || numPages === 0 || viewMode === 'single') {
+      return
+    }
+
+    const nearbyPages = nearbyPageNumbersRef.current
+    nearbyPages.clear()
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const pageNumber = Number((entry.target as HTMLElement).dataset.pageNumber)
+          if (entry.isIntersecting) {
+            nearbyPages.add(pageNumber)
+          } else {
+            nearbyPages.delete(pageNumber)
+          }
+        }
+
+        setRenderedPageNumbers(
+          createPageRenderSet(
+            nearbyPages,
+            currentPageRef.current,
+            numPages,
+            PAGE_RENDER_OVERSCAN,
+          ),
+        )
+      },
+      { rootMargin: '500px 0px', threshold: 0 },
+    )
+
+    viewer
+      .querySelectorAll<HTMLElement>('[data-viewer-page]')
+      .forEach((page) => observer.observe(page))
+    return () => {
+      observer.disconnect()
+      nearbyPages.clear()
+    }
+  }, [numPages, viewMode])
+
+  useEffect(() => {
     if (!searchOpen) {
       return
     }
@@ -477,8 +579,10 @@ function App() {
     const timeout = window.setTimeout(() => {
       void (async () => {
         try {
+          const searchStarted = performance.now()
           const matches: SearchMatch[] = []
           const normalizedQuery = query.toLowerCase()
+          setSearchProgress({ processed: 0, total: pdfDocument.numPages })
 
           for (let batchStart = 1; batchStart <= pdfDocument.numPages; batchStart += 8) {
             const batchEnd = Math.min(pdfDocument.numPages, batchStart + 7)
@@ -513,9 +617,15 @@ function App() {
                 )
               }
             }
+
+            setSearchProgress({ processed: batchEnd, total: pdfDocument.numPages })
+            await yieldToMainThread()
           }
 
           if (searchGenerationRef.current === generation) {
+            console.info(
+              `Text extraction/search time: ${formatDuration(performance.now() - searchStarted)} (${pdfDocument.numPages} pages)`,
+            )
             setSearchMatches(matches)
             setSelectedMatchIndex(matches.length > 0 ? 0 : -1)
             if (matches.length > 0 && viewModeRef.current === 'single') {
@@ -525,10 +635,12 @@ function App() {
               setPageInput(String(firstMatchPage))
             }
             setIsSearching(false)
+            setSearchProgress(null)
           }
         } catch (error) {
           if (searchGenerationRef.current === generation) {
             setIsSearching(false)
+            setSearchProgress(null)
             setErrorMessage(`Search failed: ${getErrorMessage(error)}`)
           }
         }
@@ -611,7 +723,8 @@ function App() {
       restoreFrame = window.requestAnimationFrame(() => {
         const bounds = anchoredPage.getBoundingClientRect()
         const viewportTop = headerRef.current?.offsetHeight ?? 0
-        const desiredPageTop = viewportTop - zoomAnchor.relativeOffset * bounds.height
+        const desiredPageTop =
+          viewportTop + zoomAnchor.topMargin - zoomAnchor.relativeOffset * bounds.height
         window.scrollBy({ top: bounds.top - desiredPageTop, behavior: 'auto' })
 
         if (finish) {
@@ -668,18 +781,8 @@ function App() {
     let finishing = false
     let finished = false
 
-    function pagesThroughTargetAreRendered() {
-      if (viewModeRef.current === 'single') {
-        return restoredPage.querySelector('.react-pdf__Page__canvas') !== null
-      }
-
-      for (let candidatePage = 1; candidatePage <= pageNumber; candidatePage += 1) {
-        const page = pageRefs.current.get(candidatePage)
-        if (!page?.querySelector('.react-pdf__Page__canvas')) {
-          return false
-        }
-      }
-      return true
+    function targetPageIsRendered() {
+      return restoredPage.querySelector('.react-pdf__Page__canvas') !== null
     }
 
     function scrollToRestoredPage() {
@@ -747,7 +850,7 @@ function App() {
 
       window.cancelAnimationFrame(animationFrame)
       window.clearTimeout(settleTimeout)
-      if (!pagesThroughTargetAreRendered()) {
+      if (!targetPageIsRendered()) {
         return
       }
 
@@ -1054,9 +1157,44 @@ function App() {
 
     const bounds = page.getBoundingClientRect()
     const viewportTop = headerRef.current?.offsetHeight ?? 0
+    const offsetInsidePage = viewportTop - bounds.top
     zoomAnchorRef.current = {
       pageNumber,
-      relativeOffset: Math.min(1, Math.max(-1, (viewportTop - bounds.top) / bounds.height)),
+      relativeOffset: Math.min(1, Math.max(0, offsetInsidePage / bounds.height)),
+      topMargin: Math.max(0, -offsetInsidePage),
+    }
+  }
+
+  function preserveRenderedPagesForZoom() {
+    for (const page of pageRefs.current.values()) {
+      const source = page.querySelector<HTMLCanvasElement>('.react-pdf__Page__canvas')
+      const snapshotHost = page.querySelector<HTMLElement>('[data-zoom-snapshot]')
+      if (!source || !snapshotHost || source.style.visibility === 'hidden') {
+        continue
+      }
+
+      const snapshot = document.createElement('canvas')
+      snapshot.width = source.width
+      snapshot.height = source.height
+      snapshot.style.width = '100%'
+      snapshot.style.height = '100%'
+      snapshot.style.display = 'block'
+      snapshot.setAttribute('aria-hidden', 'true')
+      snapshot.getContext('2d')?.drawImage(source, 0, 0)
+      snapshotHost.replaceChildren(snapshot)
+    }
+  }
+
+  function clearZoomSnapshot(pageNumber: number) {
+    pageRefs.current
+      .get(pageNumber)
+      ?.querySelector<HTMLElement>('[data-zoom-snapshot]')
+      ?.replaceChildren()
+  }
+
+  function clearZoomSnapshots() {
+    for (const page of pageRefs.current.values()) {
+      page.querySelector<HTMLElement>('[data-zoom-snapshot]')?.replaceChildren()
     }
   }
 
@@ -1068,6 +1206,7 @@ function App() {
 
     captureZoomAnchor()
     isRestoringZoomPositionRef.current = true
+    setIsZooming(true)
     displayZoomRef.current = normalizedScale
     setDisplayZoom(normalizedScale)
     setZoomMode('manual')
@@ -1121,13 +1260,28 @@ function App() {
       return
     }
 
+    if (restoringReadingStateRef.current) {
+      pendingRestorePageRef.current = null
+      restoringReadingStateRef.current = false
+      setIsRestoring(false)
+    }
+
     const pageNumber = Math.min(numPages, Math.max(1, requestedPage))
+    ensurePageRenderWindow(pageNumber)
     beginProgrammaticNavigation(pageNumber, behavior)
     currentPageRef.current = pageNumber
     setCurrentPage(pageNumber)
     setPageInput(String(pageNumber))
     const generation = ++pageNavigationGenerationRef.current
     scrollToPageWhenReady(pageNumber, behavior, generation)
+  }
+
+  function ensurePageRenderWindow(pageNumber: number) {
+    setRenderedPageNumbers((currentPages) => {
+      const nextPages = new Set(currentPages)
+      addPageWindow(nextPages, pageNumber, numPages, PAGE_RENDER_OVERSCAN)
+      return setsAreEqual(currentPages, nextPages) ? currentPages : nextPages
+    })
   }
 
   function scrollToPageWhenReady(
@@ -1151,8 +1305,8 @@ function App() {
       }
 
       const headerHeight = headerRef.current?.offsetHeight ?? 0
-      page.style.scrollMarginTop = `${headerHeight + 16}px`
-      page.scrollIntoView({ behavior, block: 'start', inline: 'nearest' })
+      const targetTop = window.scrollY + page.getBoundingClientRect().top - headerHeight - 16
+      window.scrollTo({ top: targetTop, behavior })
     })
   }
 
@@ -1257,7 +1411,7 @@ function App() {
     setSelectedMatchIndex(nextIndex)
 
     const nextMatch = searchMatches[nextIndex]
-    if (viewMode === 'single' && nextMatch.pageNumber !== currentPageRef.current) {
+    if (nextMatch.pageNumber !== currentPageRef.current) {
       goToPage(nextMatch.pageNumber, 'auto')
     }
   }
@@ -1269,6 +1423,7 @@ function App() {
     setSearchMatches([])
     setSelectedMatchIndex(-1)
     setIsSearching(false)
+    setSearchProgress(null)
   }
 
   function selectSidebarTab(tab: SidebarTab) {
@@ -1281,9 +1436,11 @@ function App() {
   async function loadPdfOutline(document: PDFDocumentProxy) {
     const generation = ++outlineGenerationRef.current
     setOutlineLoading(true)
+    const started = performance.now()
 
     try {
       const loadedOutline = (await document.getOutline()) as PdfOutlineItem[]
+      console.info(`Bookmarks load time: ${formatDuration(performance.now() - started)}`)
       if (outlineGenerationRef.current === generation) {
         setOutline(loadedOutline ?? [])
         setOutlineLoading(false)
@@ -1300,9 +1457,11 @@ function App() {
   async function loadDocumentMetadata(document: PDFDocumentProxy) {
     const generation = ++metadataGenerationRef.current
     setMetadataLoading(true)
+    const started = performance.now()
 
     try {
       const { info, metadata } = await document.getMetadata()
+      console.info(`Metadata load time: ${formatDuration(performance.now() - started)}`)
       const pdfInfo = info as Record<string, unknown>
       const loadedMetadata: DocumentMetadata = {
         title: getMetadataValue(pdfInfo.Title, metadata?.get('dc:title')),
@@ -1331,18 +1490,83 @@ function App() {
     }
   }
 
+  function scheduleBackgroundDocumentWork(document: PDFDocumentProxy) {
+    window.clearTimeout(backgroundDocumentTaskRef.current)
+    backgroundDocumentTaskRef.current = window.setTimeout(() => {
+      void loadPdfOutline(document)
+      void loadDocumentMetadata(document)
+    }, 250)
+  }
+
+  async function loadReferencePageDimensions(
+    document: PDFDocumentProxy,
+    documentRotation: number,
+  ) {
+    try {
+      const page = await document.getPage(1)
+      firstPageProxyRef.current = page
+      const viewport = page.getViewport({
+        scale: 1,
+        rotation: normalizeRotation(page.rotate + documentRotation),
+      })
+      setFirstPageWidth(viewport.width)
+      setFirstPageHeight(viewport.height)
+    } catch (error) {
+      console.warn('Could not measure the first PDF page:', getErrorMessage(error))
+    }
+  }
+
+  function handlePageRendered(pageNumber: number, renderDuration: number) {
+    console.debug(`Page render time: page ${pageNumber} ${formatDuration(renderDuration)}`)
+    clearZoomSnapshot(pageNumber)
+    if (
+      pageNumber === currentPageRef.current &&
+      Math.abs(displayZoomRef.current - renderZoomRef.current) < 0.001
+    ) {
+      setIsZooming(false)
+    }
+    if (initialPageRenderedRef.current) {
+      return
+    }
+
+    const expectedPage = pendingRestorePageRef.current ?? currentPageRef.current
+    if (pageNumber !== expectedPage) {
+      return
+    }
+
+    initialPageRenderedRef.current = true
+    setIsLoading(false)
+    setLoadingProgress(null)
+    console.info(
+      `PDF first viewable time: ${formatDuration(performance.now() - documentLoadStartedRef.current)}`,
+    )
+    if (pdfDocumentRef.current) {
+      scheduleBackgroundDocumentWork(pdfDocumentRef.current)
+    }
+    void logMemoryUsage('First visible page rendered')
+  }
+
+  async function logMemoryUsage(label: string) {
+    try {
+      const memory = await window.electronAPI.getMemoryUsage()
+      console.info(`Memory usage - ${label}:`, memory)
+    } catch (error) {
+      console.warn('Memory measurement failed:', getErrorMessage(error))
+    }
+  }
+
   function rotatePages(delta: -90 | 90) {
     captureZoomAnchor()
     isRestoringZoomPositionRef.current = true
     const nextRotation = normalizeRotation(rotation + delta)
     const firstPage = firstPageProxyRef.current
     if (firstPage) {
-      setFirstPageWidth(
-        firstPage.getViewport({
-          scale: 1,
-          rotation: normalizeRotation(firstPage.rotate + nextRotation),
-        }).width,
-      )
+      const viewport = firstPage.getViewport({
+        scale: 1,
+        rotation: normalizeRotation(firstPage.rotate + nextRotation),
+      })
+      setFirstPageWidth(viewport.width)
+      setFirstPageHeight(viewport.height)
     }
     setRotation(nextRotation)
   }
@@ -1418,12 +1642,14 @@ function App() {
   async function openPdf() {
     setErrorMessage(null)
     setIsLoading(true)
+    setLoadingProgress('Reading PDF file...')
 
     try {
       const result = await window.electronAPI.openPdf()
 
       if (!result) {
         setIsLoading(false)
+        setLoadingProgress(null)
         return
       }
 
@@ -1431,6 +1657,7 @@ function App() {
       await refreshRecentFiles()
     } catch (error) {
       setIsLoading(false)
+      setLoadingProgress(null)
       setErrorMessage(getErrorMessage(error))
     }
   }
@@ -1438,6 +1665,7 @@ function App() {
   async function openDroppedPdf(file: File) {
     setErrorMessage(null)
     setIsLoading(true)
+    setLoadingProgress('Reading PDF file...')
 
     try {
       const result = await window.electronAPI.openDroppedPdf(file)
@@ -1445,6 +1673,7 @@ function App() {
       await refreshRecentFiles()
     } catch (error) {
       setIsLoading(false)
+      setLoadingProgress(null)
       setErrorMessage(getErrorMessage(error))
     }
   }
@@ -1514,6 +1743,7 @@ function App() {
   async function openRecentPdf(id: string) {
     setErrorMessage(null)
     setIsLoading(true)
+    setLoadingProgress('Reading PDF file...')
     recentFilesRef.current?.removeAttribute('open')
 
     try {
@@ -1522,6 +1752,7 @@ function App() {
       await refreshRecentFiles()
     } catch (error) {
       setIsLoading(false)
+      setLoadingProgress(null)
       setErrorMessage(getErrorMessage(error))
       await refreshRecentFiles()
     }
@@ -1530,12 +1761,17 @@ function App() {
   function loadOpenedPdf(result: OpenedPdf) {
     const readingState = result.readingState
     const restoredZoom = clampScale(readingState.zoom)
+    documentLoadStartedRef.current = performance.now()
+    initialPageRenderedRef.current = false
     restoringReadingStateRef.current = true
     setIsRestoring(true)
+    setLoadingProgress('Parsing PDF...')
     isRestoringZoomPositionRef.current = false
     navigationTargetRef.current = null
     window.clearTimeout(navigationTimeoutRef.current)
     window.clearTimeout(zoomDebounceRef.current)
+    window.clearTimeout(zoomSnapshotTimeoutRef.current)
+    window.clearTimeout(backgroundDocumentTaskRef.current)
     pendingRestorePageRef.current = readingState.page
     zoomAnchorRef.current = null
     pageTextCacheRef.current.clear()
@@ -1546,13 +1782,18 @@ function App() {
     setDocumentMetadata(null)
     setMetadataLoading(false)
     firstPageProxyRef.current = null
+    pdfDocumentRef.current = null
     setVisibleThumbnailPages(new Set())
+    nearbyPageNumbersRef.current.clear()
+    setRenderedPageNumbers(new Set([1]))
     setPdfDocument(null)
     closeSearch()
     setActiveDocumentId(result.id)
     displayZoomRef.current = restoredZoom
+    renderZoomRef.current = restoredZoom
     setDisplayZoom(restoredZoom)
     setRenderZoom(restoredZoom)
+    setIsZooming(false)
     setZoomMode(readingState.fitMode ? 'fit-width' : 'manual')
     setRotation(normalizeRotation(readingState.rotation))
     setPdfFile({
@@ -1564,9 +1805,11 @@ function App() {
     })
     setNumPages(0)
     setFirstPageWidth(0)
+    setFirstPageHeight(0)
     currentPageRef.current = 1
     setCurrentPage(1)
     setPageInput('1')
+    void logMemoryUsage('PDF open started')
   }
 
   async function refreshRecentFiles() {
@@ -1959,6 +2202,7 @@ function App() {
                   setSearchMatches([])
                   setSelectedMatchIndex(-1)
                   setIsSearching(query.trim().length > 0)
+                  setSearchProgress(null)
                 }}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter') {
@@ -1974,7 +2218,9 @@ function App() {
 
             <span className="min-w-24 text-center text-sm text-slate-300" aria-live="polite">
               {isSearching
-                ? 'Searching...'
+                ? searchProgress
+                  ? `Searching page ${searchProgress.processed} of ${searchProgress.total}...`
+                  : 'Searching...'
                 : searchQuery.trim() && searchMatches.length === 0
                   ? 'No results'
                   : searchMatches.length > 0
@@ -2015,6 +2261,22 @@ function App() {
         {errorMessage ? (
           <div className="mb-3 rounded-xl border border-red-500/40 bg-red-950/60 px-4 py-3 text-red-100 shadow-lg shadow-red-950/20">
             {errorMessage}
+          </div>
+        ) : null}
+        {loadingProgress ? (
+          <div
+            role="status"
+            className="mb-3 flex items-center gap-3 rounded-xl border border-blue-500/30 bg-blue-950/35 px-4 py-3 text-sm text-blue-100"
+          >
+            <span className="size-4 animate-spin rounded-full border-2 border-blue-300/30 border-t-blue-300" />
+            <div>
+              <p className="font-medium">{loadingProgress}</p>
+              {numPages >= 200 ? (
+                <p className="mt-0.5 text-xs text-blue-200/70">
+                  Large document mode is rendering only pages near the viewport.
+                </p>
+              ) : null}
+            </div>
           </div>
         ) : null}
 
@@ -2179,34 +2441,52 @@ function App() {
                     loading={<StatusMessage>Loading PDF...</StatusMessage>}
                     error={<StatusMessage>PDF failed to load.</StatusMessage>}
                     onLoadSuccess={(loadedDocument) => {
+                      console.info(
+                        `PDF load time: ${formatDuration(performance.now() - documentLoadStartedRef.current)} (${loadedDocument.numPages} pages)`,
+                      )
                       const loadedPages = loadedDocument.numPages
                       const restoredPage = Math.min(
                         loadedPages,
                         Math.max(1, pendingRestorePageRef.current ?? 1),
                       )
+                      pdfDocumentRef.current = loadedDocument
                       setPdfDocument(loadedDocument)
-                      void loadPdfOutline(loadedDocument)
-                      void loadDocumentMetadata(loadedDocument)
+                      void loadReferencePageDimensions(loadedDocument, rotation)
                       pendingRestorePageRef.current = restoredPage
                       currentPageRef.current = restoredPage
                       setCurrentPage(restoredPage)
                       setPageInput(String(restoredPage))
+                      setRenderedPageNumbers(
+                        createPageRenderSet(
+                          new Set([restoredPage]),
+                          restoredPage,
+                          loadedPages,
+                          PAGE_RENDER_OVERSCAN,
+                        ),
+                      )
                       setNumPages(loadedPages)
-                      setIsLoading(false)
+                      setLoadingProgress(
+                        `Rendering page ${restoredPage} of ${loadedPages}...`,
+                      )
                       setErrorMessage(null)
+                      void logMemoryUsage('PDF document parsed')
                     }}
                     onLoadError={(error) => {
+                      pdfDocumentRef.current = null
                       pendingRestorePageRef.current = null
                       restoringReadingStateRef.current = false
                       setIsRestoring(false)
                       setIsLoading(false)
+                      setLoadingProgress(null)
                       setErrorMessage(getErrorMessage(error))
                     }}
                     onSourceError={(error) => {
+                      pdfDocumentRef.current = null
                       pendingRestorePageRef.current = null
                       restoringReadingStateRef.current = false
                       setIsRestoring(false)
                       setIsLoading(false)
+                      setLoadingProgress(null)
                       setErrorMessage(getErrorMessage(error))
                     }}
                   >
@@ -2214,42 +2494,71 @@ function App() {
                       {(viewMode === 'single'
                         ? [currentPage]
                         : Array.from({ length: numPages }, (_, index) => index + 1)
-                      ).map((pageNumber) => (
-                        <div
-                          key={`page-${pageNumber}`}
-                          ref={(element) => {
-                            if (element) {
-                              pageRefs.current.set(pageNumber, element)
-                            } else {
-                              pageRefs.current.delete(pageNumber)
-                            }
-                          }}
-                          data-page-number={pageNumber}
-                          className="flex w-max min-w-full justify-center scroll-mt-24"
-                        >
-                          <RotatedPage
-                            pageNumber={pageNumber}
-                            scale={renderZoom}
-                            rotation={rotation}
-                            customTextRenderer={
-                              searchMatches.length > 0 ? renderSearchText : undefined
-                            }
-                            onPageLoad={
-                              viewMode === 'single' || pageNumber === 1
-                                ? (page: PDFPageProxy) => {
-                                    firstPageProxyRef.current = page
-                                    setFirstPageWidth(
-                                      page.getViewport({
-                                        scale: 1,
-                                        rotation: normalizeRotation(page.rotate + rotation),
-                                      }).width,
-                                    )
+                      ).map((pageNumber) => {
+                        const shouldRender =
+                          viewMode === 'single' || renderedPageNumbers.has(pageNumber)
+                        return (
+                          <div
+                            key={`page-${pageNumber}`}
+                            ref={(element) => {
+                              if (element) {
+                                pageRefs.current.set(pageNumber, element)
+                              } else {
+                                pageRefs.current.delete(pageNumber)
+                              }
+                            }}
+                            data-page-number={pageNumber}
+                            data-viewer-page=""
+                            className="flex w-max min-w-full justify-center scroll-mt-24"
+                            style={{ minHeight: estimatedPageHeight * displayZoom }}
+                          >
+                            <div
+                              className={`relative ${isZooming ? 'transition-transform duration-100 ease-out' : ''}`}
+                              style={{
+                                minWidth: estimatedPageWidth * renderZoom,
+                                minHeight: estimatedPageHeight * renderZoom,
+                                transform: `scale(${zoomPreviewScale})`,
+                                transformOrigin: 'top center',
+                              }}
+                            >
+                              <div
+                                data-zoom-snapshot=""
+                                className="pointer-events-none absolute inset-0 z-20 overflow-hidden"
+                              />
+                              {shouldRender ? (
+                                <RotatedPage
+                                  pageNumber={pageNumber}
+                                  scale={renderZoom}
+                                  rotation={rotation}
+                                  customTextRenderer={
+                                    searchMatches.length > 0 ? renderSearchText : undefined
                                   }
-                                : undefined
-                            }
-                          />
-                        </div>
-                      ))}
+                                  onPageLoad={
+                                    viewMode === 'single' || pageNumber === 1
+                                      ? (page: PDFPageProxy) => {
+                                          firstPageProxyRef.current = page
+                                          const viewport = page.getViewport({
+                                            scale: 1,
+                                            rotation: normalizeRotation(page.rotate + rotation),
+                                          })
+                                          setFirstPageWidth(viewport.width)
+                                          setFirstPageHeight(viewport.height)
+                                        }
+                                      : undefined
+                                  }
+                                  onPageRender={handlePageRendered}
+                                />
+                              ) : (
+                                <PagePlaceholder
+                                  pageNumber={pageNumber}
+                                  width={estimatedPageWidth * renderZoom}
+                                  height={estimatedPageHeight * renderZoom}
+                                />
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
                     </div>
                   </Document>
                 </div>
@@ -2278,7 +2587,9 @@ function App() {
                 <StatusDivider />
                 <StatusItem>
                   {isSearching
-                    ? 'Searching...'
+                    ? searchProgress
+                      ? `Searching ${searchProgress.processed} of ${searchProgress.total}`
+                      : 'Searching...'
                     : searchMatches.length > 0
                       ? `Match ${selectedMatchIndex + 1} of ${searchMatches.length}`
                       : searchQuery.trim()
@@ -2302,16 +2613,23 @@ function RotatedPage({
   rotation,
   customTextRenderer,
   onPageLoad,
+  onPageRender,
 }: {
   pageNumber: number
   scale: number
   rotation: number
   customTextRenderer?: (props: { pageNumber: number; itemIndex: number; str: string }) => string
   onPageLoad?: (page: PDFPageProxy) => void
+  onPageRender?: (pageNumber: number, duration: number) => void
 }) {
   const [intrinsicRotation, setIntrinsicRotation] = useState<number | null>(null)
+  const renderStartedRef = useRef(0)
   const renderedRotation =
     intrinsicRotation === null ? undefined : normalizeRotation(intrinsicRotation + rotation)
+
+  useEffect(() => {
+    renderStartedRef.current = performance.now()
+  }, [customTextRenderer, pageNumber, renderedRotation, scale])
 
   return (
     <Page
@@ -2323,9 +2641,32 @@ function RotatedPage({
         setIntrinsicRotation(page.rotate)
         onPageLoad?.(page)
       }}
+      onRenderSuccess={() => {
+        onPageRender?.(pageNumber, performance.now() - renderStartedRef.current)
+      }}
       loading={<StatusMessage>Loading page {pageNumber}...</StatusMessage>}
       error={<StatusMessage>Failed to render page {pageNumber}.</StatusMessage>}
     />
+  )
+}
+
+function PagePlaceholder({
+  pageNumber,
+  width,
+  height,
+}: {
+  pageNumber: number
+  width: number
+  height: number
+}) {
+  return (
+    <div
+      aria-label={`Page ${pageNumber} waiting to render`}
+      style={{ width, height }}
+      className="flex max-w-full items-center justify-center rounded bg-slate-800/45 text-xs text-slate-500"
+    >
+      Page {pageNumber}
+    </div>
   )
 }
 
@@ -2479,8 +2820,15 @@ function LazyThumbnail({
   onNavigate: (pageNumber: number) => void
 }) {
   const [intrinsicRotation, setIntrinsicRotation] = useState<number | null>(null)
+  const renderStartedRef = useRef(0)
   const renderedRotation =
     intrinsicRotation === null ? undefined : normalizeRotation(intrinsicRotation + rotation)
+
+  useEffect(() => {
+    if (visible) {
+      renderStartedRef.current = performance.now()
+    }
+  }, [pageNumber, renderedRotation, visible, width])
 
   return (
     <div
@@ -2498,6 +2846,11 @@ function LazyThumbnail({
           width={width}
           rotate={renderedRotation}
           onLoadSuccess={(page) => setIntrinsicRotation(page.rotate)}
+          onRenderSuccess={() => {
+            console.debug(
+              `Thumbnail generation time: page ${pageNumber} ${formatDuration(performance.now() - renderStartedRef.current)}`,
+            )
+          }}
           loading={<ThumbnailPlaceholder pageNumber={pageNumber} width={width} />}
           error={<ThumbnailPlaceholder pageNumber={pageNumber} width={width} failed />}
           onItemClick={({ pageNumber: selectedPage }) => onNavigate(selectedPage)}
@@ -2848,6 +3201,7 @@ async function getPageText(
     return cachedText
   }
 
+  const started = performance.now()
   const page = await document.getPage(pageNumber)
   const textContent = await page.getTextContent()
   const itemStarts: number[] = []
@@ -2865,7 +3219,51 @@ async function getPageText(
 
   const pageText = { text, itemStarts }
   cache.set(pageNumber, pageText)
+  console.debug(
+    `Text extraction time: page ${pageNumber} ${formatDuration(performance.now() - started)}`,
+  )
   return pageText
+}
+
+function addPageWindow(
+  pages: Set<number>,
+  centerPage: number,
+  totalPages: number,
+  radius: number,
+) {
+  for (
+    let pageNumber = Math.max(1, centerPage - radius);
+    pageNumber <= Math.min(totalPages, centerPage + radius);
+    pageNumber += 1
+  ) {
+    pages.add(pageNumber)
+  }
+}
+
+function createPageRenderSet(
+  nearbyPages: Set<number>,
+  currentPage: number,
+  totalPages: number,
+  radius: number,
+) {
+  const pages = new Set<number>()
+  for (const pageNumber of nearbyPages) {
+    addPageWindow(pages, pageNumber, totalPages, radius)
+  }
+  addPageWindow(pages, currentPage, totalPages, radius)
+  return pages
+}
+
+function setsAreEqual(first: Set<number>, second: Set<number>) {
+  return first.size === second.size && [...first].every((value) => second.has(value))
+}
+
+function yieldToMainThread() {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+}
+
+function formatDuration(duration: number) {
+  return `${Math.round(duration)}ms`
 }
 
 function escapeHtml(text: string) {

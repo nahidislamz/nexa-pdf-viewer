@@ -49,4 +49,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
   },
   notifyRendererReady: () => ipcRenderer.send('pdf:renderer-ready'),
+  getMemoryUsage: () => ipcRenderer.invoke('performance:get-memory'),
 })
