@@ -36,6 +36,7 @@ function emptyStore() {
   return {
     recentFiles: [],
     documentStates: {},
+    highlightDocuments: {},
     preferences: {
       sidebarTab: 'thumbnails',
       viewMode: 'continuous',
@@ -164,8 +165,12 @@ async function readStore() {
         parsed.documentStates && typeof parsed.documentStates === 'object'
           ? parsed.documentStates
           : {},
+      highlightDocuments:
+        parsed.highlightDocuments && typeof parsed.highlightDocuments === 'object'
+          ? parsed.highlightDocuments
+          : {},
       preferences: {
-        sidebarTab: ['thumbnails', 'bookmarks', 'info'].includes(parsed.preferences?.sidebarTab)
+        sidebarTab: ['thumbnails', 'bookmarks', 'highlights', 'info'].includes(parsed.preferences?.sidebarTab)
           ? parsed.preferences.sidebarTab
           : 'thumbnails',
         viewMode: parsed.preferences?.viewMode === 'single' ? 'single' : 'continuous',
@@ -213,6 +218,81 @@ function sanitizeReadingState(state) {
   }
 }
 
+function getHighlightDocumentKey(filePath, fileSize, modifiedAt) {
+  const normalizedPath = process.platform === 'win32' ? filePath.toLowerCase() : filePath
+  return createHash('sha256')
+    .update(`${normalizedPath}\0${fileSize}\0${modifiedAt}`)
+    .digest('hex')
+}
+
+function sanitizeHighlight(highlight) {
+  if (!highlight || typeof highlight !== 'object') {
+    return null
+  }
+
+  const id = typeof highlight.id === 'string' ? highlight.id.slice(0, 128) : ''
+  const text = typeof highlight.text === 'string' ? highlight.text.trim().slice(0, 10000) : ''
+  const color = ['yellow', 'green', 'blue'].includes(highlight.color)
+    ? highlight.color
+    : null
+  const pageNumber = Math.max(1, Math.trunc(Number(highlight.pageNumber) || 0))
+  const rotation = ((Math.round((Number(highlight.rotation) || 0) / 90) * 90) % 360 + 360) % 360
+  const createdDate = new Date(highlight.createdDate)
+  const rectangles = Array.isArray(highlight.rectangles)
+    ? highlight.rectangles.slice(0, 200).flatMap((rectangle) => {
+        const x = Number(rectangle?.x)
+        const y = Number(rectangle?.y)
+        const width = Number(rectangle?.width)
+        const height = Number(rectangle?.height)
+        if (
+          ![x, y, width, height].every(Number.isFinite) ||
+          width <= 0 ||
+          height <= 0
+        ) {
+          return []
+        }
+
+        const safeX = Math.min(1, Math.max(0, x))
+        const safeY = Math.min(1, Math.max(0, y))
+        const safeWidth = Math.min(1 - safeX, Math.max(0, width))
+        const safeHeight = Math.min(1 - safeY, Math.max(0, height))
+        if (safeWidth <= 0 || safeHeight <= 0) {
+          return []
+        }
+        return [{
+          x: safeX,
+          y: safeY,
+          width: safeWidth,
+          height: safeHeight,
+        }]
+      })
+    : []
+
+  if (!id || !text || !color || rectangles.length === 0 || Number.isNaN(createdDate.getTime())) {
+    return null
+  }
+
+  return {
+    id,
+    pageNumber,
+    text,
+    color,
+    rectangles,
+    rotation,
+    createdDate: createdDate.toISOString(),
+  }
+}
+
+function getStoredHighlights(store, filePath, fileSize, modifiedAt) {
+  const key = getHighlightDocumentKey(filePath, fileSize, modifiedAt)
+  const document = store.highlightDocuments[key]
+  if (!document || !Array.isArray(document.highlights)) {
+    return []
+  }
+
+  return document.highlights.map(sanitizeHighlight).filter(Boolean)
+}
+
 function sanitizeWindowState(state) {
   if (!state || typeof state !== 'object') {
     return null
@@ -235,16 +315,24 @@ function sanitizeWindowState(state) {
 
 async function loadPdf(filePath) {
   const started = performance.now()
-  const buffer = await fs.readFile(filePath)
+  const [buffer, fileStats] = await Promise.all([fs.readFile(filePath), fs.stat(filePath)])
   console.info(
     `PDF file read time: ${Math.round(performance.now() - started)}ms (${Math.round(buffer.byteLength / 1024 / 1024)}MB)`,
   )
   const id = getDocumentId(filePath)
   const name = path.basename(filePath)
+  const modifiedAt = fileStats.mtimeMs
 
   return withStore(async (store) => {
     store.recentFiles = [
-      { id, name, path: filePath, openedAt: Date.now() },
+      {
+        id,
+        name,
+        path: filePath,
+        fileSize: buffer.byteLength,
+        modifiedAt,
+        openedAt: Date.now(),
+      },
       ...store.recentFiles.filter((item) => item.id !== id),
     ].slice(0, 20)
     await saveStore(store)
@@ -254,8 +342,10 @@ async function loadPdf(filePath) {
       name,
       filePath,
       fileSize: buffer.byteLength,
+      modifiedAt,
       dataUrl: `data:application/pdf;base64,${buffer.toString('base64')}`,
       readingState: sanitizeReadingState(store.documentStates[id]),
+      highlights: getStoredHighlights(store, filePath, buffer.byteLength, modifiedAt),
     }
   })
 }
@@ -458,7 +548,12 @@ ipcMain.handle('pdf:open-recent', (_event, id) =>
     }
 
     try {
-      const buffer = await fs.readFile(recentFile.path)
+      const [buffer, fileStats] = await Promise.all([
+        fs.readFile(recentFile.path),
+        fs.stat(recentFile.path),
+      ])
+      recentFile.fileSize = buffer.byteLength
+      recentFile.modifiedAt = fileStats.mtimeMs
       recentFile.openedAt = Date.now()
       store.recentFiles = [
         recentFile,
@@ -471,8 +566,15 @@ ipcMain.handle('pdf:open-recent', (_event, id) =>
         name: recentFile.name,
         filePath: recentFile.path,
         fileSize: buffer.byteLength,
+        modifiedAt: fileStats.mtimeMs,
         dataUrl: `data:application/pdf;base64,${buffer.toString('base64')}`,
         readingState: sanitizeReadingState(store.documentStates[id]),
+        highlights: getStoredHighlights(
+          store,
+          recentFile.path,
+          buffer.byteLength,
+          fileStats.mtimeMs,
+        ),
       }
     } catch (error) {
       if (error.code === 'ENOENT') {
@@ -496,6 +598,36 @@ ipcMain.handle('pdf:save-state', (_event, id, state) =>
     console.debug('Saved page:', readingState.page)
     store.documentStates[id] = readingState
     await saveStore(store)
+  }),
+)
+
+ipcMain.handle('pdf:save-highlights', (_event, identity, highlights) =>
+  withStore(async (store) => {
+    const recentFile = store.recentFiles.find((item) => item.id === identity?.id)
+    const fileSize = Number(identity?.fileSize)
+    const modifiedAt = Number(identity?.modifiedAt)
+    if (
+      !recentFile ||
+      !Number.isFinite(fileSize) ||
+      !Number.isFinite(modifiedAt) ||
+      recentFile.fileSize !== fileSize ||
+      recentFile.modifiedAt !== modifiedAt
+    ) {
+      throw new Error('The PDF identity changed. Reopen the document before saving highlights.')
+    }
+
+    const sanitizedHighlights = Array.isArray(highlights)
+      ? highlights.map(sanitizeHighlight).filter(Boolean).slice(0, 10000)
+      : []
+    const key = getHighlightDocumentKey(recentFile.path, fileSize, modifiedAt)
+    store.highlightDocuments[key] = {
+      filePath: recentFile.path,
+      fileSize,
+      modifiedAt,
+      highlights: sanitizedHighlights,
+    }
+    await saveStore(store)
+    return sanitizedHighlights
   }),
 )
 
@@ -544,7 +676,7 @@ ipcMain.handle('preferences:get-sidebar-tab', () =>
 
 ipcMain.handle('preferences:set-sidebar-tab', (_event, sidebarTab) =>
   withStore(async (store) => {
-    store.preferences.sidebarTab = ['thumbnails', 'bookmarks', 'info'].includes(sidebarTab)
+    store.preferences.sidebarTab = ['thumbnails', 'bookmarks', 'highlights', 'info'].includes(sidebarTab)
       ? sidebarTab
       : 'thumbnails'
     await saveStore(store)

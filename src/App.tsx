@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { Document, Page, Thumbnail, pdfjs } from 'react-pdf'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
+import { HighlightOverlay } from './components/Viewer/HighlightOverlay'
+import type {
+  HighlightColor,
+  HighlightRectangle,
+  PdfHighlight,
+  PendingHighlightSelection,
+} from './types/highlights'
+import { transformHighlightRectangle } from './utils/highlights'
 import 'react-pdf/dist/Page/TextLayer.css'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 
@@ -14,6 +22,7 @@ type PdfFile = {
   name: string
   filePath: string
   fileSize: number
+  modifiedAt: number
   dataUrl: string
 }
 
@@ -24,6 +33,7 @@ type OpenedPdf = PdfFile & {
     fitMode: boolean
     rotation: number
   }
+  highlights: PdfHighlight[]
 }
 
 type SystemPdfOpenMessage =
@@ -48,7 +58,7 @@ type SearchMatch = {
   end: number
 }
 
-type SidebarTab = 'thumbnails' | 'bookmarks' | 'info'
+type SidebarTab = 'thumbnails' | 'bookmarks' | 'highlights' | 'info'
 type ViewMode = 'continuous' | 'single'
 type ViewerBackground = 'dark-gray' | 'black' | 'light-gray' | 'white'
 
@@ -96,6 +106,7 @@ const KEYBOARD_SHORTCUTS = [
   ['Ctrl + O', 'Open PDF'],
   ['Ctrl + P', 'Print PDF'],
   ['Ctrl + F', 'Search'],
+  ['Ctrl + H', 'Highlight selected text'],
   ['Ctrl + Mouse Wheel', 'Zoom'],
   ['Ctrl + +', 'Zoom In'],
   ['Ctrl + -', 'Zoom Out'],
@@ -145,6 +156,15 @@ function App() {
   const [outlineLoading, setOutlineLoading] = useState(false)
   const [documentMetadata, setDocumentMetadata] = useState<DocumentMetadata | null>(null)
   const [metadataLoading, setMetadataLoading] = useState(false)
+  const [highlights, setHighlights] = useState<PdfHighlight[]>([])
+  const [pendingHighlightSelection, setPendingHighlightSelection] =
+    useState<PendingHighlightSelection | null>(null)
+  const [highlightContextMenu, setHighlightContextMenu] = useState<{
+    highlightId: string
+    x: number
+    y: number
+  } | null>(null)
+  const [focusedHighlightId, setFocusedHighlightId] = useState<string | null>(null)
   const [rotation, setRotation] = useState(0)
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false)
   const [dragActive, setDragActive] = useState(false)
@@ -193,6 +213,8 @@ function App() {
   const documentLoadStartedRef = useRef(0)
   const initialPageRenderedRef = useRef(false)
   const backgroundDocumentTaskRef = useRef(0)
+  const highlightSaveGenerationRef = useRef(0)
+  const highlightFocusTimeoutRef = useRef(0)
 
   const fitWidthZoom = clampScale(
     viewerWidth > 0 && firstPageWidth > 0 ? viewerWidth / firstPageWidth : displayZoom,
@@ -213,6 +235,15 @@ function App() {
     }
     return groupedMatches
   }, [searchMatches])
+  const highlightsByPage = useMemo(() => {
+    const groupedHighlights = new Map<number, PdfHighlight[]>()
+    for (const highlight of highlights) {
+      const pageHighlights = groupedHighlights.get(highlight.pageNumber) ?? []
+      pageHighlights.push(highlight)
+      groupedHighlights.set(highlight.pageNumber, pageHighlights)
+    }
+    return groupedHighlights
+  }, [highlights])
 
   const renderSearchText = useCallback(
     ({ pageNumber, itemIndex, str }: { pageNumber: number; itemIndex: number; str: string }) => {
@@ -433,6 +464,7 @@ function App() {
       window.clearTimeout(zoomDebounceRef.current)
       window.clearTimeout(zoomSnapshotTimeoutRef.current)
       window.clearTimeout(backgroundDocumentTaskRef.current)
+      window.clearTimeout(highlightFocusTimeoutRef.current)
       window.cancelAnimationFrame(pageScrollFrameRef.current)
       window.cancelAnimationFrame(wheelZoomFrameRef.current)
     },
@@ -998,6 +1030,55 @@ function App() {
   }, [isRestoring, numPages, observedSinglePage, viewMode])
 
   useEffect(() => {
+    function handleSelectionPointerUp(event: PointerEvent) {
+      const target = event.target instanceof Element ? event.target : null
+      if (
+        event.button !== 0 ||
+        !pdfFile ||
+        !target?.closest('.react-pdf__Page__textContent') ||
+        target.closest('[data-highlight-toolbar]')
+      ) {
+        return
+      }
+
+      window.requestAnimationFrame(() => {
+        const selection = readPdfTextSelection()
+        setPendingHighlightSelection(selection)
+        setHighlightContextMenu(null)
+      })
+    }
+
+    function handleOutsidePointerDown(event: PointerEvent) {
+      const target = event.target instanceof Element ? event.target : null
+      if (
+        target?.closest('[data-highlight-toolbar]') ||
+        target?.closest('[data-highlight-context-menu]')
+      ) {
+        return
+      }
+
+      setHighlightContextMenu(null)
+      if (!target?.closest('.react-pdf__Page__textContent')) {
+        setPendingHighlightSelection(null)
+      }
+    }
+
+    function handleViewerScroll() {
+      setPendingHighlightSelection(null)
+      setHighlightContextMenu(null)
+    }
+
+    window.addEventListener('pointerup', handleSelectionPointerUp)
+    window.addEventListener('pointerdown', handleOutsidePointerDown)
+    window.addEventListener('scroll', handleViewerScroll, true)
+    return () => {
+      window.removeEventListener('pointerup', handleSelectionPointerUp)
+      window.removeEventListener('pointerdown', handleOutsidePointerDown)
+      window.removeEventListener('scroll', handleViewerScroll, true)
+    }
+  })
+
+  useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null
 
@@ -1033,6 +1114,15 @@ function App() {
         event.preventDefault()
         if (pdfDocument) {
           setSearchOpen(true)
+        }
+        return
+      }
+
+      if (event.ctrlKey && event.key.toLowerCase() === 'h') {
+        event.preventDefault()
+        const selection = pendingHighlightSelection ?? readPdfTextSelection()
+        if (selection) {
+          addHighlight(selection, 'yellow')
         }
         return
       }
@@ -1399,6 +1489,248 @@ function App() {
     }
 
     goToPage(requestedPage)
+  }
+
+  function readPdfTextSelection(): PendingHighlightSelection | null {
+    if (!pdfFile || isZooming) {
+      return null
+    }
+
+    const selection = window.getSelection()
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      return null
+    }
+
+    const range = selection.getRangeAt(0)
+    const startPage = getPdfPageElement(range.startContainer)
+    const endPage = getPdfPageElement(range.endContainer)
+    if (!startPage || startPage !== endPage) {
+      setErrorMessage('Highlights must be created within a single PDF page.')
+      return null
+    }
+
+    const pageNumber = Number(startPage.dataset.pageNumber)
+    const pageBounds = startPage.getBoundingClientRect()
+    const text = selection.toString().replace(/\s+/g, ' ').trim()
+    if (!Number.isFinite(pageNumber) || !text || pageBounds.width <= 0 || pageBounds.height <= 0) {
+      return null
+    }
+
+    const clientRectangles = Array.from(range.getClientRects()).filter(
+      (rectangle) =>
+        rectangle.width > 0.5 &&
+        rectangle.height > 0.5 &&
+        rectangle.right > pageBounds.left &&
+        rectangle.left < pageBounds.right &&
+        rectangle.bottom > pageBounds.top &&
+        rectangle.top < pageBounds.bottom,
+    )
+    const rectangles = clientRectangles.map((rectangle) => ({
+      x: clampUnit((Math.max(rectangle.left, pageBounds.left) - pageBounds.left) / pageBounds.width),
+      y: clampUnit((Math.max(rectangle.top, pageBounds.top) - pageBounds.top) / pageBounds.height),
+      width: clampUnit(
+        (Math.min(rectangle.right, pageBounds.right) - Math.max(rectangle.left, pageBounds.left)) /
+          pageBounds.width,
+      ),
+      height: clampUnit(
+        (Math.min(rectangle.bottom, pageBounds.bottom) - Math.max(rectangle.top, pageBounds.top)) /
+          pageBounds.height,
+      ),
+    }))
+    if (rectangles.length === 0) {
+      return null
+    }
+
+    const selectionBounds = clientRectangles.reduce(
+      (bounds, rectangle) => ({
+        left: Math.min(bounds.left, rectangle.left),
+        top: Math.min(bounds.top, rectangle.top),
+        right: Math.max(bounds.right, rectangle.right),
+        bottom: Math.max(bounds.bottom, rectangle.bottom),
+      }),
+      {
+        left: clientRectangles[0].left,
+        top: clientRectangles[0].top,
+        right: clientRectangles[0].right,
+        bottom: clientRectangles[0].bottom,
+      },
+    )
+
+    return {
+      pageNumber,
+      text,
+      rectangles,
+      rotation,
+      toolbarX: Math.min(window.innerWidth - 150, Math.max(150, (selectionBounds.left + selectionBounds.right) / 2)),
+      toolbarY:
+        selectionBounds.top > 64 ? selectionBounds.top - 52 : selectionBounds.bottom + 10,
+    }
+  }
+
+  function addHighlight(selection: PendingHighlightSelection, color: HighlightColor) {
+    const highlight: PdfHighlight = {
+      id: crypto.randomUUID(),
+      pageNumber: selection.pageNumber,
+      text: selection.text,
+      color,
+      rectangles: selection.rectangles,
+      rotation: selection.rotation,
+      createdDate: new Date().toISOString(),
+    }
+    updateHighlights([...highlights, highlight])
+    clearHighlightSelection()
+  }
+
+  function removeSelectedHighlights(selection: PendingHighlightSelection) {
+    const idsToRemove = new Set(
+      highlights
+        .filter((highlight) => highlight.pageNumber === selection.pageNumber)
+        .filter((highlight) =>
+          highlight.rectangles.some((rectangle) => {
+            const transformed = transformHighlightRectangle(
+              rectangle,
+              normalizeRotation(selection.rotation - highlight.rotation),
+            )
+            return selection.rectangles.some((selectedRectangle) =>
+              rectanglesOverlap(transformed, selectedRectangle),
+            )
+          }),
+        )
+        .map((highlight) => highlight.id),
+    )
+
+    if (idsToRemove.size > 0) {
+      updateHighlights(highlights.filter((highlight) => !idsToRemove.has(highlight.id)))
+    }
+    clearHighlightSelection()
+  }
+
+  function removeHighlight(highlightId: string) {
+    if (!highlights.some((highlight) => highlight.id === highlightId)) {
+      return
+    }
+
+    updateHighlights(highlights.filter((highlight) => highlight.id !== highlightId))
+    setHighlightContextMenu(null)
+    if (focusedHighlightId === highlightId) {
+      setFocusedHighlightId(null)
+    }
+  }
+
+  function updateHighlights(nextHighlights: PdfHighlight[]) {
+    const document = pdfFile
+    if (!document) {
+      return
+    }
+
+    const previousHighlights = highlights
+    const generation = ++highlightSaveGenerationRef.current
+    setHighlights(nextHighlights)
+    void window.electronAPI
+      .savePdfHighlights(
+        {
+          id: document.id,
+          fileSize: document.fileSize,
+          modifiedAt: document.modifiedAt,
+        },
+        nextHighlights,
+      )
+      .then((savedHighlights) => {
+        if (highlightSaveGenerationRef.current === generation) {
+          setHighlights(savedHighlights)
+        }
+      })
+      .catch((error) => {
+        if (highlightSaveGenerationRef.current === generation) {
+          setHighlights(previousHighlights)
+          setErrorMessage(`Failed to save highlight: ${getErrorMessage(error)}`)
+        }
+      })
+  }
+
+  function clearHighlightSelection() {
+    window.getSelection()?.removeAllRanges()
+    setPendingHighlightSelection(null)
+  }
+
+  function openHighlightContextMenu(
+    event: React.MouseEvent<HTMLDivElement>,
+    pageNumber: number,
+  ) {
+    const page = event.currentTarget.querySelector<HTMLElement>('.react-pdf__Page')
+    if (!page) {
+      return
+    }
+
+    const bounds = page.getBoundingClientRect()
+    const point = {
+      x: (event.clientX - bounds.left) / bounds.width,
+      y: (event.clientY - bounds.top) / bounds.height,
+    }
+    const highlight = [...(highlightsByPage.get(pageNumber) ?? [])]
+      .reverse()
+      .find((candidate) =>
+        candidate.rectangles.some((rectangle) => {
+          const transformed = transformHighlightRectangle(
+            rectangle,
+            normalizeRotation(rotation - candidate.rotation),
+          )
+          return pointInsideRectangle(point, transformed)
+        }),
+      )
+    if (!highlight) {
+      return
+    }
+
+    event.preventDefault()
+    setPendingHighlightSelection(null)
+    setHighlightContextMenu({
+      highlightId: highlight.id,
+      x: Math.min(window.innerWidth - 190, event.clientX),
+      y: Math.min(window.innerHeight - 60, event.clientY),
+    })
+  }
+
+  function navigateToHighlight(highlight: PdfHighlight) {
+    setHighlightContextMenu(null)
+    goToPage(highlight.pageNumber, 'auto')
+    scrollToHighlightWhenReady(highlight.id, highlight.pageNumber)
+  }
+
+  function scrollToHighlightWhenReady(highlightId: string, pageNumber: number, attempt = 0) {
+    window.requestAnimationFrame(() => {
+      const page = pageRefs.current.get(pageNumber)
+      const target = Array.from(
+        page?.querySelectorAll<HTMLElement>('[data-highlight-id]') ?? [],
+      ).find((element) => element.dataset.highlightId === highlightId)
+      const bounds = target?.getBoundingClientRect()
+      if (
+        !target ||
+        !page?.querySelector('.react-pdf__Page') ||
+        !bounds ||
+        bounds.width <= 0 ||
+        bounds.height <= 0
+      ) {
+        if (attempt < 90) {
+          window.setTimeout(
+            () => scrollToHighlightWhenReady(highlightId, pageNumber, attempt + 1),
+            16,
+          )
+        }
+        return
+      }
+
+      const headerHeight = headerRef.current?.offsetHeight ?? 0
+      const targetTop =
+        window.scrollY + bounds.top - Math.max(headerHeight + 16, (window.innerHeight - bounds.height) / 2)
+      window.scrollTo({ top: targetTop, behavior: 'smooth' })
+      window.clearTimeout(highlightFocusTimeoutRef.current)
+      setFocusedHighlightId(highlightId)
+      highlightFocusTimeoutRef.current = window.setTimeout(
+        () => setFocusedHighlightId(null),
+        1800,
+      )
+    })
   }
 
   function selectSearchMatch(direction: 1 | -1) {
@@ -1781,6 +2113,11 @@ function App() {
     setOutlineLoading(false)
     setDocumentMetadata(null)
     setMetadataLoading(false)
+    highlightSaveGenerationRef.current += 1
+    setHighlights(result.highlights ?? [])
+    setPendingHighlightSelection(null)
+    setHighlightContextMenu(null)
+    setFocusedHighlightId(null)
     firstPageProxyRef.current = null
     pdfDocumentRef.current = null
     setVisibleThumbnailPages(new Set())
@@ -1801,6 +2138,7 @@ function App() {
       name: result.name,
       filePath: result.filePath,
       fileSize: result.fileSize,
+      modifiedAt: result.modifiedAt,
       dataUrl: result.dataUrl,
     })
     setNumPages(0)
@@ -1833,6 +2171,69 @@ function App() {
               <p className="mt-1 text-sm text-slate-400">The first PDF in the drop will be opened.</p>
             </div>
           </div>
+        </div>
+      ) : null}
+
+      {pendingHighlightSelection ? (
+        <div
+          data-highlight-toolbar=""
+          role="toolbar"
+          aria-label="Text highlight colors"
+          onPointerDown={(event) => event.preventDefault()}
+          className="fixed z-50 flex h-11 items-center gap-1 rounded-xl border border-slate-600 bg-slate-900/95 p-1.5 shadow-2xl shadow-black/50 backdrop-blur"
+          style={{
+            left: pendingHighlightSelection.toolbarX,
+            top: pendingHighlightSelection.toolbarY,
+            transform: 'translateX(-50%)',
+          }}
+        >
+          {(['yellow', 'green', 'blue'] as const).map((color) => (
+            <button
+              key={color}
+              type="button"
+              aria-label={`Highlight ${color}`}
+              title={`Highlight ${color}`}
+              onClick={() => addHighlight(pendingHighlightSelection, color)}
+              className="grid size-8 place-items-center rounded-lg hover:bg-slate-700"
+            >
+              <span
+                className={`size-5 rounded-full border-2 ${
+                  color === 'yellow'
+                    ? 'border-yellow-200 bg-yellow-400'
+                    : color === 'green'
+                      ? 'border-green-200 bg-green-400'
+                      : 'border-blue-200 bg-blue-400'
+                }`}
+              />
+            </button>
+          ))}
+          <span aria-hidden="true" className="mx-1 h-6 w-px bg-slate-600" />
+          <button
+            type="button"
+            title="Remove overlapping highlights"
+            onClick={() => removeSelectedHighlights(pendingHighlightSelection)}
+            className="h-8 rounded-lg px-2 text-xs font-medium text-red-200 hover:bg-red-500/20"
+          >
+            Remove
+          </button>
+        </div>
+      ) : null}
+
+      {highlightContextMenu ? (
+        <div
+          data-highlight-context-menu=""
+          role="menu"
+          className="fixed z-50 w-44 rounded-xl border border-slate-600 bg-slate-900 p-1.5 shadow-2xl shadow-black/50"
+          style={{ left: highlightContextMenu.x, top: highlightContextMenu.y }}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => removeHighlight(highlightContextMenu.highlightId)}
+            className="w-full rounded-lg px-3 py-2 text-left text-sm text-red-200 hover:bg-red-500/20"
+          >
+            Remove Highlight
+          </button>
         </div>
       ) : null}
 
@@ -2306,7 +2707,7 @@ function App() {
                 role="tablist"
                 aria-label="Sidebar sections"
                 className={`border-b border-slate-700/80 bg-slate-950/20 ${
-                  thumbnailSidebarOpen ? 'grid grid-cols-3 gap-2 p-3' : 'flex flex-col gap-2 p-2 pt-12'
+                  thumbnailSidebarOpen ? 'grid grid-cols-2 gap-2 p-3' : 'flex flex-col gap-2 p-2 pt-12'
                 }`}
               >
                 <button
@@ -2327,6 +2728,27 @@ function App() {
                   {!thumbnailSidebarOpen ? (
                     <span aria-hidden="true" className="pointer-events-none absolute left-full z-40 ml-3 whitespace-nowrap rounded-lg border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-xs font-medium text-slate-100 opacity-0 shadow-xl transition-opacity duration-150 group-hover/sidebar-tab:opacity-100">
                       Thumbnails
+                    </span>
+                  ) : null}
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sidebarTab === 'highlights'}
+                  onClick={() => selectSidebarTab('highlights')}
+                  className={`group/sidebar-tab relative flex min-w-0 items-center justify-center rounded-xl border font-semibold transition-all duration-200 ${
+                    thumbnailSidebarOpen ? 'flex-col gap-1.5 px-2 py-3 text-[11px]' : 'size-10 self-center'
+                  } ${
+                    sidebarTab === 'highlights'
+                      ? 'border-blue-300 bg-blue-500/30 text-white ring-1 ring-blue-400/50 shadow-[0_0_20px_rgba(59,130,246,0.28)]'
+                      : 'border-transparent text-slate-400 hover:border-slate-600 hover:bg-slate-800 hover:text-slate-100'
+                  }`}
+                >
+                  <HighlightsIcon />
+                  {thumbnailSidebarOpen ? <span>Highlights</span> : <span className="sr-only">Highlights</span>}
+                  {!thumbnailSidebarOpen ? (
+                    <span aria-hidden="true" className="pointer-events-none absolute left-full z-40 ml-3 whitespace-nowrap rounded-lg border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-xs font-medium text-slate-100 opacity-0 shadow-xl transition-opacity duration-150 group-hover/sidebar-tab:opacity-100">
+                      Highlights
                     </span>
                   ) : null}
                 </button>
@@ -2402,6 +2824,12 @@ function App() {
                     </p>
                   )}
                 </div>
+              ) : thumbnailSidebarOpen && sidebarTab === 'highlights' ? (
+                <HighlightsPanel
+                  highlights={highlights}
+                  onNavigate={navigateToHighlight}
+                  onRemove={removeHighlight}
+                />
               ) : thumbnailSidebarOpen ? (
                 <DocumentInfoPanel
                   file={pdfFile}
@@ -2509,6 +2937,7 @@ function App() {
                             }}
                             data-page-number={pageNumber}
                             data-viewer-page=""
+                            onContextMenu={(event) => openHighlightContextMenu(event, pageNumber)}
                             className="flex w-max min-w-full justify-center scroll-mt-24"
                             style={{ minHeight: estimatedPageHeight * displayZoom }}
                           >
@@ -2524,6 +2953,11 @@ function App() {
                               <div
                                 data-zoom-snapshot=""
                                 className="pointer-events-none absolute inset-0 z-20 overflow-hidden"
+                              />
+                              <HighlightOverlay
+                                highlights={highlightsByPage.get(pageNumber) ?? []}
+                                rotation={rotation}
+                                focusedHighlightId={focusedHighlightId}
                               />
                               {shouldRender ? (
                                 <RotatedPage
@@ -2666,6 +3100,79 @@ function PagePlaceholder({
       className="flex max-w-full items-center justify-center rounded bg-slate-800/45 text-xs text-slate-500"
     >
       Page {pageNumber}
+    </div>
+  )
+}
+
+function HighlightsPanel({
+  highlights,
+  onNavigate,
+  onRemove,
+}: {
+  highlights: PdfHighlight[]
+  onNavigate: (highlight: PdfHighlight) => void
+  onRemove: (highlightId: string) => void
+}) {
+  const sortedHighlights = [...highlights].sort(
+    (left, right) => Date.parse(right.createdDate) - Date.parse(left.createdDate),
+  )
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto p-3">
+      <div className="mb-3 flex items-center justify-between px-1">
+        <h2 className="text-sm font-semibold text-slate-100">Highlights</h2>
+        <span className="rounded-full bg-slate-800 px-2 py-0.5 text-xs text-slate-400">
+          {highlights.length}
+        </span>
+      </div>
+      {sortedHighlights.length === 0 ? (
+        <p className="rounded-xl border border-dashed border-slate-700 px-3 py-8 text-center text-sm leading-5 text-slate-400">
+          Select PDF text to create a highlight.
+        </p>
+      ) : (
+        <div className="space-y-2.5">
+          {sortedHighlights.map((highlight) => (
+            <div
+              key={highlight.id}
+              className="group rounded-xl border border-slate-700/80 bg-slate-800/45 p-3 transition-colors hover:border-slate-600 hover:bg-slate-800/80"
+            >
+              <button
+                type="button"
+                title={highlight.text}
+                onClick={() => onNavigate(highlight)}
+                className="block w-full text-left"
+              >
+                <span className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                  <span
+                    className={`size-2.5 rounded-full ${
+                      highlight.color === 'yellow'
+                        ? 'bg-yellow-400'
+                        : highlight.color === 'green'
+                          ? 'bg-green-400'
+                          : 'bg-blue-400'
+                    }`}
+                  />
+                  Page {highlight.pageNumber}
+                </span>
+                <span className="mt-2 line-clamp-3 block text-sm leading-5 text-slate-100">
+                  {highlight.text}
+                </span>
+                <span className="mt-2 block text-[11px] text-slate-500">
+                  {new Date(highlight.createdDate).toLocaleString()}
+                </span>
+              </button>
+              <button
+                type="button"
+                aria-label={`Remove highlight from page ${highlight.pageNumber}`}
+                onClick={() => onRemove(highlight.id)}
+                className="mt-2 rounded-lg px-2 py-1 text-xs text-red-300 opacity-70 hover:bg-red-500/15 hover:opacity-100"
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -3043,6 +3550,20 @@ function BookmarkIcon() {
   )
 }
 
+function HighlightsIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
+      <path
+        d="m5 15 7.8-7.8 4 4L9 19H5v-4ZM14.5 5.5l1.8-1.8a1.4 1.4 0 0 1 2 0l2 2a1.4 1.4 0 0 1 0 2l-1.8 1.8-4-4Z"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinejoin="round"
+      />
+      <path d="M4 21h16" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function InfoIcon() {
   return (
     <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
@@ -3119,6 +3640,36 @@ function getErrorMessage(error: unknown) {
   }
 
   return String(error)
+}
+
+function getPdfPageElement(node: Node) {
+  const element = node instanceof Element ? node : node.parentElement
+  return element?.closest<HTMLElement>('.react-pdf__Page') ?? null
+}
+
+function clampUnit(value: number) {
+  return Math.min(1, Math.max(0, value))
+}
+
+function rectanglesOverlap(left: HighlightRectangle, right: HighlightRectangle) {
+  return (
+    left.x < right.x + right.width &&
+    left.x + left.width > right.x &&
+    left.y < right.y + right.height &&
+    left.y + left.height > right.y
+  )
+}
+
+function pointInsideRectangle(
+  point: { x: number; y: number },
+  rectangle: HighlightRectangle,
+) {
+  return (
+    point.x >= rectangle.x &&
+    point.x <= rectangle.x + rectangle.width &&
+    point.y >= rectangle.y &&
+    point.y <= rectangle.y + rectangle.height
+  )
 }
 
 function getMetadataValue(...values: unknown[]) {

@@ -10,8 +10,20 @@ type OpenedPdf = {
   name: string
   filePath: string
   fileSize: number
+  modifiedAt: number
   dataUrl: string
   readingState: PdfReadingState
+  highlights: PdfHighlight[]
+}
+
+type PdfHighlight = {
+  id: string
+  pageNumber: number
+  text: string
+  color: 'yellow' | 'green' | 'blue'
+  rectangles: Array<{ x: number; y: number; width: number; height: number }>
+  rotation: number
+  createdDate: string
 }
 
 type SystemPdfOpenMessage =
@@ -27,14 +39,18 @@ declare global {
       getRecentPdfs: () => Promise<Array<{ id: string; name: string }>>
       openRecentPdf: (id: string) => Promise<OpenedPdf>
       savePdfState: (id: string, state: PdfReadingState) => Promise<void>
+      savePdfHighlights: (
+        identity: { id: string; fileSize: number; modifiedAt: number },
+        highlights: PdfHighlight[],
+      ) => Promise<PdfHighlight[]>
       printPdf: (id: string) => Promise<{ printed: boolean; cancelled: boolean }>
       exportPage: (exportData: {
         data: Uint8Array
         format: 'png' | 'jpeg'
         defaultName: string
       }) => Promise<string | null>
-      getSidebarTab: () => Promise<'thumbnails' | 'bookmarks' | 'info'>
-      setSidebarTab: (tab: 'thumbnails' | 'bookmarks' | 'info') => Promise<void>
+      getSidebarTab: () => Promise<'thumbnails' | 'bookmarks' | 'highlights' | 'info'>
+      setSidebarTab: (tab: 'thumbnails' | 'bookmarks' | 'highlights' | 'info') => Promise<void>
       getViewMode: () => Promise<'continuous' | 'single'>
       setViewMode: (viewMode: 'continuous' | 'single') => Promise<void>
       getViewerBackground: () => Promise<'dark-gray' | 'black' | 'light-gray' | 'white'>
