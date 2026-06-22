@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   savePdfState: (id, state) => ipcRenderer.invoke('pdf:save-state', id, state),
   savePdfHighlights: (identity, highlights) =>
     ipcRenderer.invoke('pdf:save-highlights', identity, highlights),
+  exportHighlights: (options) => ipcRenderer.invoke('pdf:export-highlights', options),
   printPdf: (id) => ipcRenderer.invoke('pdf:print', id),
   exportPage: (exportData) => ipcRenderer.invoke('pdf:export-page', exportData),
   getSidebarTab: () => ipcRenderer.invoke('preferences:get-sidebar-tab'),

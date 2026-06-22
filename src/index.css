@@ -91,3 +91,17 @@ input:focus-visible {
   background-color: #0f172a;
   color: #f8fafc;
 }
+
+@keyframes highlight-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgb(255 255 255 / 0%);
+  }
+  45% {
+    box-shadow: 0 0 0 6px rgb(255 255 255 / 38%);
+  }
+}
+
+.highlight-pulse {
+  animation: highlight-pulse 1s ease-out;
+}

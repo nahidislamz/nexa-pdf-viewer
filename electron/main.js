@@ -232,9 +232,21 @@ function sanitizeHighlight(highlight) {
 
   const id = typeof highlight.id === 'string' ? highlight.id.slice(0, 128) : ''
   const text = typeof highlight.text === 'string' ? highlight.text.trim().slice(0, 10000) : ''
-  const color = ['yellow', 'green', 'blue'].includes(highlight.color)
+  const note = typeof highlight.note === 'string' ? highlight.note.trimEnd().slice(0, 50000) : ''
+  const color = ['yellow', 'green', 'blue', 'purple'].includes(highlight.color)
     ? highlight.color
     : null
+  const category = ['important', 'research', 'reference', 'question'].includes(
+    highlight.category,
+  )
+    ? highlight.category
+    : color === 'purple'
+      ? 'question'
+      : color === 'green'
+      ? 'research'
+      : color === 'blue'
+        ? 'reference'
+        : 'important'
   const pageNumber = Math.max(1, Math.trunc(Number(highlight.pageNumber) || 0))
   const rotation = ((Math.round((Number(highlight.rotation) || 0) / 90) * 90) % 360 + 360) % 360
   const createdDate = new Date(highlight.createdDate)
@@ -276,7 +288,9 @@ function sanitizeHighlight(highlight) {
     id,
     pageNumber,
     text,
+    note,
     color,
+    category,
     rectangles,
     rotation,
     createdDate: createdDate.toISOString(),
@@ -311,6 +325,199 @@ function sanitizeWindowState(state) {
     height: Math.max(650, Math.round(height)),
     maximized: state.maximized === true,
   }
+}
+
+const exportCategoryOrder = ['important', 'research', 'reference', 'question']
+const exportCategoryLabels = {
+  important: 'Important',
+  research: 'Research',
+  reference: 'Reference',
+  question: 'Question',
+}
+const exportColorLabels = {
+  yellow: 'Amber',
+  green: 'Mint',
+  blue: 'Sky Blue',
+  purple: 'Purple',
+}
+
+function groupHighlightsForExport(highlights) {
+  return exportCategoryOrder.flatMap((category) => {
+    const categoryHighlights = highlights.filter((highlight) => highlight.category === category)
+    if (categoryHighlights.length === 0) {
+      return []
+    }
+
+    const pages = new Map()
+    for (const highlight of categoryHighlights.sort((left, right) => left.pageNumber - right.pageNumber)) {
+      const pageHighlights = pages.get(highlight.pageNumber) ?? []
+      pageHighlights.push(highlight)
+      pages.set(highlight.pageNumber, pageHighlights)
+    }
+    return [{ category, pages: [...pages.entries()] }]
+  })
+}
+
+function buildHighlightsMarkdown(documentName, highlights, exportedAt) {
+  const lines = [
+    `# Highlights - ${documentName}`,
+    '',
+    `Exported: ${exportedAt.toLocaleString()}`,
+    '',
+  ]
+  for (const group of groupHighlightsForExport(highlights)) {
+    lines.push(`# ${exportCategoryLabels[group.category]}`, '')
+    for (const [pageNumber, pageHighlights] of group.pages) {
+      lines.push(`## Page ${pageNumber}`, '')
+      for (const highlight of pageHighlights) {
+        lines.push(
+          `**Category:** ${exportCategoryLabels[highlight.category]}`,
+          `**Color:** ${exportColorLabels[highlight.color]}`,
+          '',
+          '**Highlighted Text**',
+          '',
+          highlight.text,
+          '',
+          '**Note**',
+          '',
+          highlight.note || '_No note_',
+          '',
+          '---',
+          '',
+        )
+      }
+    }
+  }
+  return lines.join('\n')
+}
+
+function buildHighlightsText(documentName, highlights, exportedAt) {
+  const lines = [
+    `HIGHLIGHTS - ${documentName}`,
+    `Exported: ${exportedAt.toLocaleString()}`,
+    '='.repeat(72),
+    '',
+  ]
+  for (const group of groupHighlightsForExport(highlights)) {
+    lines.push(exportCategoryLabels[group.category].toUpperCase(), '')
+    for (const [pageNumber, pageHighlights] of group.pages) {
+      lines.push(`Page ${pageNumber}`, '-'.repeat(24))
+      for (const highlight of pageHighlights) {
+        lines.push(
+          `Category: ${exportCategoryLabels[highlight.category]}`,
+          `Color: ${exportColorLabels[highlight.color]}`,
+          'Highlighted Text:',
+          highlight.text,
+          'Note:',
+          highlight.note || 'No note',
+          '',
+        )
+      }
+    }
+  }
+  return lines.join('\n')
+}
+
+function buildHighlightsDocx(documentName, highlights, exportedAt) {
+  const paragraphs = [
+    wordParagraph(`Highlights - ${documentName}`, 'Title'),
+    wordParagraph(`Exported: ${exportedAt.toLocaleString()}`),
+  ]
+  for (const group of groupHighlightsForExport(highlights)) {
+    paragraphs.push(wordParagraph(exportCategoryLabels[group.category], 'Heading1'))
+    for (const [pageNumber, pageHighlights] of group.pages) {
+      paragraphs.push(wordParagraph(`Page ${pageNumber}`, 'Heading2'))
+      for (const highlight of pageHighlights) {
+        paragraphs.push(
+          wordParagraph(`Category: ${exportCategoryLabels[highlight.category]}`),
+          wordParagraph(`Color: ${exportColorLabels[highlight.color]}`),
+          wordParagraph('Highlighted Text', 'Heading3'),
+          ...highlight.text.split(/\r?\n/).map((line) => wordParagraph(line)),
+          wordParagraph('Note', 'Heading3'),
+          ...(highlight.note || 'No note').split(/\r?\n/).map((line) => wordParagraph(line)),
+        )
+      }
+    }
+  }
+
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${paragraphs.join('')}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:body></w:document>`
+  const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:sz w:val="22"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="36"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="30"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="26"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="22"/></w:rPr></w:style></w:styles>`
+  return createStoredZip([
+    ['[Content_Types].xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>`],
+    ['_rels/.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`],
+    ['word/document.xml', documentXml],
+    ['word/styles.xml', stylesXml],
+    ['word/_rels/document.xml.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`],
+  ])
+}
+
+function wordParagraph(text, style = null) {
+  const styleXml = style ? `<w:pPr><w:pStyle w:val="${style}"/></w:pPr>` : ''
+  return `<w:p>${styleXml}<w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`
+}
+
+function escapeXml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;')
+}
+
+function createStoredZip(files) {
+  const localParts = []
+  const centralParts = []
+  let offset = 0
+  for (const [name, content] of files) {
+    const nameBuffer = Buffer.from(name)
+    const contentBuffer = Buffer.from(content)
+    const crc = crc32(contentBuffer)
+    const localHeader = Buffer.alloc(30)
+    localHeader.writeUInt32LE(0x04034b50, 0)
+    localHeader.writeUInt16LE(20, 4)
+    localHeader.writeUInt16LE(0x0800, 6)
+    localHeader.writeUInt16LE(0, 8)
+    localHeader.writeUInt32LE(crc, 14)
+    localHeader.writeUInt32LE(contentBuffer.length, 18)
+    localHeader.writeUInt32LE(contentBuffer.length, 22)
+    localHeader.writeUInt16LE(nameBuffer.length, 26)
+    localParts.push(localHeader, nameBuffer, contentBuffer)
+
+    const centralHeader = Buffer.alloc(46)
+    centralHeader.writeUInt32LE(0x02014b50, 0)
+    centralHeader.writeUInt16LE(20, 4)
+    centralHeader.writeUInt16LE(20, 6)
+    centralHeader.writeUInt16LE(0x0800, 8)
+    centralHeader.writeUInt16LE(0, 10)
+    centralHeader.writeUInt32LE(crc, 16)
+    centralHeader.writeUInt32LE(contentBuffer.length, 20)
+    centralHeader.writeUInt32LE(contentBuffer.length, 24)
+    centralHeader.writeUInt16LE(nameBuffer.length, 28)
+    centralHeader.writeUInt32LE(offset, 42)
+    centralParts.push(centralHeader, nameBuffer)
+    offset += localHeader.length + nameBuffer.length + contentBuffer.length
+  }
+
+  const centralDirectory = Buffer.concat(centralParts)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(files.length, 8)
+  end.writeUInt16LE(files.length, 10)
+  end.writeUInt32LE(centralDirectory.length, 12)
+  end.writeUInt32LE(offset, 16)
+  return Buffer.concat([...localParts, centralDirectory, end])
+}
+
+function crc32(buffer) {
+  let crc = 0xffffffff
+  for (const byte of buffer) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0
 }
 
 async function loadPdf(filePath) {
@@ -630,6 +837,47 @@ ipcMain.handle('pdf:save-highlights', (_event, identity, highlights) =>
     return sanitizedHighlights
   }),
 )
+
+ipcMain.handle('pdf:export-highlights', async (_event, options) => {
+  const format = ['markdown', 'text', 'docx'].includes(options?.format)
+    ? options.format
+    : null
+  const recentFile = await withStore((store) =>
+    store.recentFiles.find((item) => item.id === options?.id),
+  )
+  const highlights = Array.isArray(options?.highlights)
+    ? options.highlights.map(sanitizeHighlight).filter(Boolean).slice(0, 10000)
+    : []
+  if (!format || !recentFile || highlights.length === 0) {
+    throw new Error('Select at least one valid highlight to export.')
+  }
+
+  const extension = format === 'markdown' ? 'md' : format === 'text' ? 'txt' : 'docx'
+  const baseName = path.basename(recentFile.name, path.extname(recentFile.name))
+  const result = await dialog.showSaveDialog(mainWindow ?? undefined, {
+    title: 'Export Highlights',
+    defaultPath: `${baseName}-highlights.${extension}`,
+    filters: [
+      {
+        name: format === 'markdown' ? 'Markdown' : format === 'text' ? 'Plain Text' : 'Word Document',
+        extensions: [extension],
+      },
+    ],
+  })
+  if (result.canceled || !result.filePath) {
+    return null
+  }
+
+  const exportedAt = new Date()
+  const output =
+    format === 'markdown'
+      ? buildHighlightsMarkdown(recentFile.name, highlights, exportedAt)
+      : format === 'text'
+        ? buildHighlightsText(recentFile.name, highlights, exportedAt)
+        : buildHighlightsDocx(recentFile.name, highlights, exportedAt)
+  await fs.writeFile(result.filePath, output)
+  return result.filePath
+})
 
 ipcMain.handle('pdf:print', async (_event, id) => {
   const recentFile = await withStore((store) =>

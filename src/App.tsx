@@ -4,6 +4,7 @@ import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { HighlightOverlay } from './components/Viewer/HighlightOverlay'
 import type {
   HighlightColor,
+  HighlightCategory,
   HighlightRectangle,
   PdfHighlight,
   PendingHighlightSelection,
@@ -102,6 +103,32 @@ const VIEWER_BACKGROUND_LABELS: Record<ViewerBackground, string> = {
   'light-gray': 'Light Gray',
   white: 'White',
 }
+const HIGHLIGHT_CATEGORY_ORDER: HighlightCategory[] = [
+  'important',
+  'research',
+  'reference',
+  'question',
+]
+const HIGHLIGHT_CATEGORY_LABELS: Record<HighlightCategory, string> = {
+  important: 'Important',
+  research: 'Research',
+  reference: 'Reference',
+  question: 'Question',
+}
+const DEFAULT_CATEGORY_BY_COLOR: Record<HighlightColor, HighlightCategory> = {
+  yellow: 'important',
+  green: 'research',
+  blue: 'reference',
+  purple: 'question',
+}
+const HIGHLIGHT_COLOR_ORDER: HighlightColor[] = ['yellow', 'green', 'blue', 'purple']
+const HIGHLIGHT_COLOR_LABELS: Record<HighlightColor, string> = {
+  yellow: 'Amber',
+  green: 'Mint',
+  blue: 'Sky Blue',
+  purple: 'Purple',
+}
+const EMPTY_HIGHLIGHTS: PdfHighlight[] = []
 const KEYBOARD_SHORTCUTS = [
   ['Ctrl + O', 'Open PDF'],
   ['Ctrl + P', 'Print PDF'],
@@ -165,6 +192,16 @@ function App() {
     y: number
   } | null>(null)
   const [focusedHighlightId, setFocusedHighlightId] = useState<string | null>(null)
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null)
+  const [selectedHighlightIds, setSelectedHighlightIds] = useState<Set<string>>(() => new Set())
+  const [exportHighlightsOpen, setExportHighlightsOpen] = useState(false)
+  const [exportFormat, setExportFormat] = useState<'markdown' | 'text' | 'docx'>('markdown')
+  const [exportScope, setExportScope] = useState<'all' | 'category' | 'selected'>('all')
+  const [exportCategory, setExportCategory] = useState<HighlightCategory>('important')
+  const [exportCategories, setExportCategories] = useState<Set<HighlightCategory>>(
+    () => new Set(HIGHLIGHT_CATEGORY_ORDER),
+  )
+  const [isExportingHighlights, setIsExportingHighlights] = useState(false)
   const [rotation, setRotation] = useState(0)
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false)
   const [dragActive, setDragActive] = useState(false)
@@ -215,6 +252,7 @@ function App() {
   const backgroundDocumentTaskRef = useRef(0)
   const highlightSaveGenerationRef = useRef(0)
   const highlightFocusTimeoutRef = useRef(0)
+  const highlightPageMapRef = useRef(new Map<number, PdfHighlight[]>())
 
   const fitWidthZoom = clampScale(
     viewerWidth > 0 && firstPageWidth > 0 ? viewerWidth / firstPageWidth : displayZoom,
@@ -242,6 +280,16 @@ function App() {
       pageHighlights.push(highlight)
       groupedHighlights.set(highlight.pageNumber, pageHighlights)
     }
+    for (const [pageNumber, pageHighlights] of groupedHighlights) {
+      const previousHighlights = highlightPageMapRef.current.get(pageNumber)
+      if (
+        previousHighlights?.length === pageHighlights.length &&
+        previousHighlights.every((highlight, index) => highlight === pageHighlights[index])
+      ) {
+        groupedHighlights.set(pageNumber, previousHighlights)
+      }
+    }
+    highlightPageMapRef.current = groupedHighlights
     return groupedHighlights
   }, [highlights])
 
@@ -1137,6 +1185,11 @@ function App() {
         return
       }
 
+      if (event.key === 'Escape' && exportHighlightsOpen) {
+        setExportHighlightsOpen(false)
+        return
+      }
+
       if (event.ctrlKey && numPages > 0) {
         if (event.key === '+' || event.key === '=' || event.code === 'NumpadAdd') {
           event.preventDefault()
@@ -1568,11 +1621,46 @@ function App() {
   }
 
   function addHighlight(selection: PendingHighlightSelection, color: HighlightColor) {
+    const duplicate = highlights.find(
+      (highlight) =>
+        highlight.pageNumber === selection.pageNumber &&
+        normalizeHighlightText(highlight.text) === normalizeHighlightText(selection.text) &&
+        highlight.rectangles.some((rectangle) =>
+          selection.rectangles.some((selectedRectangle) =>
+            rectanglesOverlap(
+              transformHighlightRectangle(
+                rectangle,
+                normalizeRotation(selection.rotation - highlight.rotation),
+              ),
+              selectedRectangle,
+            ),
+          ),
+        ),
+    )
+    if (duplicate) {
+      updateHighlights(
+        highlights.map((highlight) =>
+          highlight.id === duplicate.id
+            ? {
+                ...highlight,
+                color,
+                rectangles: selection.rectangles,
+                rotation: selection.rotation,
+              }
+            : highlight,
+        ),
+      )
+      clearHighlightSelection()
+      return
+    }
+
     const highlight: PdfHighlight = {
       id: crypto.randomUUID(),
       pageNumber: selection.pageNumber,
       text: selection.text,
       color,
+      category: DEFAULT_CATEGORY_BY_COLOR[color],
+      note: '',
       rectangles: selection.rectangles,
       rotation: selection.rotation,
       createdDate: new Date().toISOString(),
@@ -1611,9 +1699,125 @@ function App() {
     }
 
     updateHighlights(highlights.filter((highlight) => highlight.id !== highlightId))
+    setSelectedHighlightIds((current) => {
+      const next = new Set(current)
+      next.delete(highlightId)
+      return next
+    })
     setHighlightContextMenu(null)
     if (focusedHighlightId === highlightId) {
       setFocusedHighlightId(null)
+    }
+  }
+
+  function changeHighlightColor(highlightId: string, color: HighlightColor) {
+    updateHighlights(
+      highlights.map((highlight) =>
+        highlight.id === highlightId ? { ...highlight, color } : highlight,
+      ),
+    )
+    setHighlightContextMenu(null)
+  }
+
+  function changeHighlightCategory(highlightId: string, category: HighlightCategory) {
+    updateHighlights(
+      highlights.map((highlight) =>
+        highlight.id === highlightId ? { ...highlight, category } : highlight,
+      ),
+    )
+    setHighlightContextMenu(null)
+  }
+
+  async function copyHighlightText(highlightId: string) {
+    const highlight = highlights.find((candidate) => candidate.id === highlightId)
+    if (!highlight) {
+      return
+    }
+
+    try {
+      await navigator.clipboard.writeText(highlight.text)
+      setHighlightContextMenu(null)
+    } catch (error) {
+      setErrorMessage(`Could not copy highlighted text: ${getErrorMessage(error)}`)
+    }
+  }
+
+  async function copyHighlightWithNote(highlightId: string) {
+    const highlight = highlights.find((candidate) => candidate.id === highlightId)
+    if (!highlight) {
+      return
+    }
+
+    try {
+      await navigator.clipboard.writeText(
+        highlight.note ? `${highlight.text}\n\n${highlight.note}` : highlight.text,
+      )
+      setHighlightContextMenu(null)
+    } catch (error) {
+      setErrorMessage(`Could not copy highlight and note: ${getErrorMessage(error)}`)
+    }
+  }
+
+  function startEditingNote(highlightId: string) {
+    setEditingNoteId(highlightId)
+    setHighlightContextMenu(null)
+    setSidebarTab('highlights')
+    if (!thumbnailSidebarOpen) {
+      setThumbnailSidebarOpen(true)
+    }
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLTextAreaElement>(`[data-note-editor="${highlightId}"]`)?.focus()
+    })
+  }
+
+  function saveHighlightNote(highlightId: string, note: string) {
+    const normalizedNote = note.trimEnd()
+    const highlight = highlights.find((candidate) => candidate.id === highlightId)
+    if (!highlight || highlight.note === normalizedNote) {
+      return
+    }
+    updateHighlights(
+      highlights.map((candidate) =>
+        candidate.id === highlightId ? { ...candidate, note: normalizedNote } : candidate,
+      ),
+    )
+  }
+
+  function toggleHighlightSelected(highlightId: string) {
+    setSelectedHighlightIds((current) => toggleSetValue(current, highlightId))
+  }
+
+  async function exportHighlightCollection() {
+    if (!pdfFile) {
+      return
+    }
+
+    let candidates = highlights
+    if (exportScope === 'category') {
+      candidates = candidates.filter((highlight) => highlight.category === exportCategory)
+    } else if (exportScope === 'selected') {
+      candidates = candidates.filter((highlight) => selectedHighlightIds.has(highlight.id))
+    }
+    candidates = candidates.filter((highlight) => exportCategories.has(highlight.category))
+    if (candidates.length === 0) {
+      setErrorMessage('Select at least one highlight and category to export.')
+      return
+    }
+
+    setIsExportingHighlights(true)
+    try {
+      const exportedPath = await window.electronAPI.exportHighlights({
+        id: pdfFile.id,
+        format: exportFormat,
+        highlights: candidates,
+      })
+      if (exportedPath) {
+        setExportHighlightsOpen(false)
+      }
+    } catch (error) {
+      setErrorMessage(`Highlight export failed: ${getErrorMessage(error)}`)
+    } finally {
+      setIsExportingHighlights(false)
     }
   }
 
@@ -1682,12 +1886,17 @@ function App() {
       return
     }
 
+    showHighlightContextMenu(event, highlight.id)
+  }
+
+  function showHighlightContextMenu(event: React.MouseEvent, highlightId: string) {
     event.preventDefault()
+    event.stopPropagation()
     setPendingHighlightSelection(null)
     setHighlightContextMenu({
-      highlightId: highlight.id,
-      x: Math.min(window.innerWidth - 190, event.clientX),
-      y: Math.min(window.innerHeight - 60, event.clientY),
+      highlightId,
+      x: Math.min(window.innerWidth - 230, Math.max(8, event.clientX)),
+      y: Math.min(window.innerHeight - 390, Math.max(8, event.clientY)),
     })
   }
 
@@ -1725,10 +1934,15 @@ function App() {
         window.scrollY + bounds.top - Math.max(headerHeight + 16, (window.innerHeight - bounds.height) / 2)
       window.scrollTo({ top: targetTop, behavior: 'smooth' })
       window.clearTimeout(highlightFocusTimeoutRef.current)
-      setFocusedHighlightId(highlightId)
       highlightFocusTimeoutRef.current = window.setTimeout(
-        () => setFocusedHighlightId(null),
-        1800,
+        () => {
+          setFocusedHighlightId(highlightId)
+          highlightFocusTimeoutRef.current = window.setTimeout(
+            () => setFocusedHighlightId(null),
+            1100,
+          )
+        },
+        300,
       )
     })
   }
@@ -1746,6 +1960,57 @@ function App() {
     if (nextMatch.pageNumber !== currentPageRef.current) {
       goToPage(nextMatch.pageNumber, 'auto')
     }
+  }
+
+  function highlightSelectedSearchMatch(color: HighlightColor, attempt = 0) {
+    const match = searchMatches[selectedMatchIndex]
+    if (!match) {
+      return
+    }
+
+    if (currentPageRef.current !== match.pageNumber) {
+      goToPage(match.pageNumber, 'auto')
+    }
+
+    window.requestAnimationFrame(() => {
+      const marks = Array.from(
+        document.querySelectorAll<HTMLElement>(`[data-search-match="${match.index}"]`),
+      )
+      const page = marks[0]?.closest<HTMLElement>('.react-pdf__Page')
+      if (!page || marks.length === 0) {
+        if (attempt < 90) {
+          window.setTimeout(() => highlightSelectedSearchMatch(color, attempt + 1), 16)
+        }
+        return
+      }
+
+      const pageBounds = page.getBoundingClientRect()
+      const rectangles = marks.flatMap((mark) =>
+        Array.from(mark.getClientRects()).map((rectangle) => ({
+          x: clampUnit((rectangle.left - pageBounds.left) / pageBounds.width),
+          y: clampUnit((rectangle.top - pageBounds.top) / pageBounds.height),
+          width: clampUnit(rectangle.width / pageBounds.width),
+          height: clampUnit(rectangle.height / pageBounds.height),
+        })),
+      )
+      const pageText = pageTextCacheRef.current.get(match.pageNumber)
+      const text = pageText?.text.slice(match.start, match.end).trim() || searchQuery.trim()
+      if (!text || rectangles.length === 0) {
+        return
+      }
+
+      addHighlight(
+        {
+          pageNumber: match.pageNumber,
+          text,
+          rectangles,
+          rotation,
+          toolbarX: 0,
+          toolbarY: 0,
+        },
+        color,
+      )
+    })
   }
 
   function closeSearch() {
@@ -2118,6 +2383,9 @@ function App() {
     setPendingHighlightSelection(null)
     setHighlightContextMenu(null)
     setFocusedHighlightId(null)
+    setEditingNoteId(null)
+    setSelectedHighlightIds(new Set())
+    setExportHighlightsOpen(false)
     firstPageProxyRef.current = null
     pdfDocumentRef.current = null
     setVisibleThumbnailPages(new Set())
@@ -2187,23 +2455,17 @@ function App() {
             transform: 'translateX(-50%)',
           }}
         >
-          {(['yellow', 'green', 'blue'] as const).map((color) => (
+          {HIGHLIGHT_COLOR_ORDER.map((color) => (
             <button
               key={color}
               type="button"
-              aria-label={`Highlight ${color}`}
-              title={`Highlight ${color}`}
+              aria-label={`Highlight ${HIGHLIGHT_COLOR_LABELS[color]}`}
+              title={`Highlight ${HIGHLIGHT_COLOR_LABELS[color]}`}
               onClick={() => addHighlight(pendingHighlightSelection, color)}
               className="grid size-8 place-items-center rounded-lg hover:bg-slate-700"
             >
               <span
-                className={`size-5 rounded-full border-2 ${
-                  color === 'yellow'
-                    ? 'border-yellow-200 bg-yellow-400'
-                    : color === 'green'
-                      ? 'border-green-200 bg-green-400'
-                      : 'border-blue-200 bg-blue-400'
-                }`}
+                className={`size-5 rounded-full border-2 ${highlightColorSwatchClass(color)}`}
               />
             </button>
           ))}
@@ -2223,17 +2485,196 @@ function App() {
         <div
           data-highlight-context-menu=""
           role="menu"
-          className="fixed z-50 w-44 rounded-xl border border-slate-600 bg-slate-900 p-1.5 shadow-2xl shadow-black/50"
+          className="fixed z-50 w-56 rounded-xl border border-slate-600 bg-slate-900 p-2 shadow-2xl shadow-black/50"
           style={{ left: highlightContextMenu.x, top: highlightContextMenu.y }}
         >
+          <p className="px-2 pb-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+            Change Color
+          </p>
+          <div className="mb-2 flex gap-1 px-1">
+            {HIGHLIGHT_COLOR_ORDER.map((color) => (
+              <button
+                key={color}
+                type="button"
+                role="menuitem"
+                aria-label={`Change highlight to ${HIGHLIGHT_COLOR_LABELS[color]}`}
+                onClick={() => changeHighlightColor(highlightContextMenu.highlightId, color)}
+                className="grid size-9 place-items-center rounded-lg hover:bg-slate-700"
+              >
+                <span className={`size-5 rounded-full ${highlightColorClass(color)}`} />
+              </button>
+            ))}
+          </div>
+          <label className="mb-2 block border-y border-slate-700 py-2">
+            <span className="mb-1 block px-2 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+              Category
+            </span>
+            <select
+              value={
+                highlights.find((highlight) => highlight.id === highlightContextMenu.highlightId)
+                  ?.category ?? 'important'
+              }
+              onChange={(event) =>
+                changeHighlightCategory(
+                  highlightContextMenu.highlightId,
+                  event.target.value as HighlightCategory,
+                )
+              }
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-200"
+            >
+              {HIGHLIGHT_CATEGORY_ORDER.map((category) => (
+                <option key={category} value={category}>
+                  {HIGHLIGHT_CATEGORY_LABELS[category]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => startEditingNote(highlightContextMenu.highlightId)}
+            className="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
+          >
+            {highlights.find((highlight) => highlight.id === highlightContextMenu.highlightId)?.note
+              ? 'Edit Note'
+              : 'Add Note'}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void copyHighlightText(highlightContextMenu.highlightId)}
+            className="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
+          >
+            Copy Highlighted Text
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void copyHighlightWithNote(highlightContextMenu.highlightId)}
+            className="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
+          >
+            Copy Highlight + Note
+          </button>
           <button
             type="button"
             role="menuitem"
             onClick={() => removeHighlight(highlightContextMenu.highlightId)}
             className="w-full rounded-lg px-3 py-2 text-left text-sm text-red-200 hover:bg-red-500/20"
           >
-            Remove Highlight
+            Delete Highlight
           </button>
+        </div>
+      ) : null}
+
+      {exportHighlightsOpen ? (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/70 p-4 backdrop-blur-sm">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="export-highlights-title"
+            className="w-full max-w-lg rounded-2xl border border-slate-600 bg-slate-900 p-5 shadow-2xl shadow-black/60"
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h2 id="export-highlights-title" className="text-lg font-semibold text-white">
+                  Export Highlights
+                </h2>
+                <p className="mt-1 text-xs text-slate-400">
+                  Include highlighted text, notes, page numbers, colors, and categories.
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Close export dialog"
+                onClick={() => setExportHighlightsOpen(false)}
+                className="grid size-9 place-items-center rounded-lg text-xl text-slate-400 hover:bg-slate-800 hover:text-white"
+              >
+                &times;
+              </button>
+            </div>
+
+            <label className="mb-4 block text-sm text-slate-300">
+              <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">Format</span>
+              <select
+                value={exportFormat}
+                onChange={(event) => setExportFormat(event.target.value as typeof exportFormat)}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2"
+              >
+                <option value="markdown">Markdown (.md)</option>
+                <option value="text">Plain Text (.txt)</option>
+                <option value="docx">Word (.docx)</option>
+              </select>
+            </label>
+
+            <fieldset className="mb-4">
+              <legend className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Export Scope</legend>
+              <div className="grid gap-2 sm:grid-cols-3">
+                {([
+                  ['all', `All (${highlights.length})`],
+                  ['category', 'Current Category'],
+                  ['selected', `Selected (${selectedHighlightIds.size})`],
+                ] as const).map(([scope, label]) => (
+                  <label key={scope} className={`cursor-pointer rounded-lg border px-3 py-2 text-sm ${exportScope === scope ? 'border-blue-400 bg-blue-500/15 text-blue-100' : 'border-slate-700 text-slate-400'}`}>
+                    <input
+                      type="radio"
+                      name="export-scope"
+                      value={scope}
+                      checked={exportScope === scope}
+                      onChange={() => setExportScope(scope)}
+                      className="mr-2"
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+
+            {exportScope === 'category' ? (
+              <label className="mb-4 block text-sm text-slate-300">
+                <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">Current Category</span>
+                <select
+                  value={exportCategory}
+                  onChange={(event) => setExportCategory(event.target.value as HighlightCategory)}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2"
+                >
+                  {HIGHLIGHT_CATEGORY_ORDER.map((category) => (
+                    <option key={category} value={category}>{HIGHLIGHT_CATEGORY_LABELS[category]}</option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+
+            <fieldset className="mb-5">
+              <legend className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Categories to Include</legend>
+              <div className="grid grid-cols-2 gap-2">
+                {HIGHLIGHT_CATEGORY_ORDER.map((category) => (
+                  <label key={category} className="flex cursor-pointer items-center gap-2 rounded-lg bg-slate-800/60 px-3 py-2 text-sm text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={exportCategories.has(category)}
+                      onChange={() => setExportCategories((current) => toggleSetValue(current, category))}
+                    />
+                    <span className={`size-2.5 rounded-full ${highlightCategoryColorClass(category)}`} />
+                    {HIGHLIGHT_CATEGORY_LABELS[category]}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setExportHighlightsOpen(false)} className="rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:bg-slate-800">
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void exportHighlightCollection()}
+                disabled={isExportingHighlights || highlights.length === 0}
+                className="rounded-lg bg-blue-500 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-400 disabled:opacity-40"
+              >
+                {isExportingHighlights ? 'Exporting...' : 'Choose Save Location'}
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
@@ -2629,6 +3070,23 @@ function App() {
                     : ''}
             </span>
 
+            <div className="flex h-10 items-center gap-1 rounded-lg border border-slate-700 px-2">
+              <span className="mr-1 text-xs text-slate-400">Highlight</span>
+              {HIGHLIGHT_COLOR_ORDER.map((color) => (
+                <button
+                  key={color}
+                  type="button"
+                  aria-label={`Highlight selected search match ${HIGHLIGHT_COLOR_LABELS[color]}`}
+                  title={`Highlight match ${HIGHLIGHT_COLOR_LABELS[color]}`}
+                  disabled={selectedMatchIndex < 0 || isSearching}
+                  onClick={() => highlightSelectedSearchMatch(color)}
+                  className="grid size-7 place-items-center rounded hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-35"
+                >
+                  <span className={`size-4 rounded-full ${highlightColorClass(color)}`} />
+                </button>
+              ))}
+            </div>
+
             <button
               type="button"
               onClick={() => selectSearchMatch(-1)}
@@ -2829,6 +3287,14 @@ function App() {
                   highlights={highlights}
                   onNavigate={navigateToHighlight}
                   onRemove={removeHighlight}
+                  onContextMenu={showHighlightContextMenu}
+                  editingNoteId={editingNoteId}
+                  selectedHighlightIds={selectedHighlightIds}
+                  onEditNote={startEditingNote}
+                  onSaveNote={saveHighlightNote}
+                  onFinishNote={() => setEditingNoteId(null)}
+                  onToggleSelected={toggleHighlightSelected}
+                  onExport={() => setExportHighlightsOpen(true)}
                 />
               ) : thumbnailSidebarOpen ? (
                 <DocumentInfoPanel
@@ -2925,6 +3391,13 @@ function App() {
                       ).map((pageNumber) => {
                         const shouldRender =
                           viewMode === 'single' || renderedPageNumbers.has(pageNumber)
+                        const pageHighlights =
+                          highlightsByPage.get(pageNumber) ?? EMPTY_HIGHLIGHTS
+                        const pageFocusedHighlightId = pageHighlights.some(
+                          (highlight) => highlight.id === focusedHighlightId,
+                        )
+                          ? focusedHighlightId
+                          : null
                         return (
                           <div
                             key={`page-${pageNumber}`}
@@ -2955,9 +3428,9 @@ function App() {
                                 className="pointer-events-none absolute inset-0 z-20 overflow-hidden"
                               />
                               <HighlightOverlay
-                                highlights={highlightsByPage.get(pageNumber) ?? []}
+                                highlights={pageHighlights}
                                 rotation={rotation}
-                                focusedHighlightId={focusedHighlightId}
+                                focusedHighlightId={pageFocusedHighlightId}
                               />
                               {shouldRender ? (
                                 <RotatedPage
@@ -3108,71 +3581,296 @@ function HighlightsPanel({
   highlights,
   onNavigate,
   onRemove,
+  onContextMenu,
+  editingNoteId,
+  selectedHighlightIds,
+  onEditNote,
+  onSaveNote,
+  onFinishNote,
+  onToggleSelected,
+  onExport,
 }: {
   highlights: PdfHighlight[]
   onNavigate: (highlight: PdfHighlight) => void
   onRemove: (highlightId: string) => void
+  onContextMenu: (event: React.MouseEvent, highlightId: string) => void
+  editingNoteId: string | null
+  selectedHighlightIds: Set<string>
+  onEditNote: (highlightId: string) => void
+  onSaveNote: (highlightId: string, note: string) => void
+  onFinishNote: () => void
+  onToggleSelected: (highlightId: string) => void
+  onExport: () => void
 }) {
-  const sortedHighlights = [...highlights].sort(
-    (left, right) => Date.parse(right.createdDate) - Date.parse(left.createdDate),
+  const [categoryFilter, setCategoryFilter] = useState<HighlightCategory | 'all'>('all')
+  const [collapsedCategories, setCollapsedCategories] = useState<Set<HighlightCategory>>(
+    () => new Set(),
   )
+  const [collapsedPages, setCollapsedPages] = useState<Set<string>>(() => new Set())
+  const categoryCounts = Object.fromEntries(
+    HIGHLIGHT_CATEGORY_ORDER.map((category) => [
+      category,
+      highlights.filter((highlight) => highlight.category === category).length,
+    ]),
+  ) as Record<HighlightCategory, number>
+  const visibleCategories =
+    categoryFilter === 'all' ? HIGHLIGHT_CATEGORY_ORDER : [categoryFilter]
+
+  function toggleCategory(category: HighlightCategory) {
+    setCollapsedCategories((current) => toggleSetValue(current, category))
+  }
+
+  function togglePage(pageKey: string) {
+    setCollapsedPages((current) => toggleSetValue(current, pageKey))
+  }
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto p-3">
-      <div className="mb-3 flex items-center justify-between px-1">
-        <h2 className="text-sm font-semibold text-slate-100">Highlights</h2>
-        <span className="rounded-full bg-slate-800 px-2 py-0.5 text-xs text-slate-400">
-          {highlights.length}
-        </span>
+      <div className="mb-3 flex items-center justify-between gap-2 px-1">
+        <h2 className="text-sm font-semibold text-slate-100">Highlights ({highlights.length})</h2>
+        <button
+          type="button"
+          onClick={onExport}
+          disabled={highlights.length === 0}
+          className="rounded-lg border border-slate-600 px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:border-blue-400 hover:bg-blue-500/10 disabled:opacity-35"
+        >
+          Export Highlights
+        </button>
       </div>
-      {sortedHighlights.length === 0 ? (
+      <div className="mb-3 rounded-xl border border-slate-700/80 bg-slate-950/35 p-3">
+        <p className="mb-2 text-xs font-semibold text-slate-200">Summary</p>
+        <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
+          <div className="flex justify-between gap-2 text-slate-300">
+            <dt>Highlights</dt><dd>{highlights.length}</dd>
+          </div>
+          {HIGHLIGHT_CATEGORY_ORDER.map((category) => (
+            <div key={category} className="flex justify-between gap-2 text-slate-400">
+              <dt>{HIGHLIGHT_CATEGORY_LABELS[category]}</dt><dd>{categoryCounts[category]}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+
+      <div className="mb-3 flex flex-wrap gap-1.5" aria-label="Filter highlights by category">
+        <button
+          type="button"
+          onClick={() => setCategoryFilter('all')}
+          className={`rounded-lg px-2 py-1 text-xs ${
+            categoryFilter === 'all' ? 'bg-blue-500/25 text-blue-100' : 'bg-slate-800 text-slate-400 hover:text-white'
+          }`}
+        >
+          All ({highlights.length})
+        </button>
+        {HIGHLIGHT_CATEGORY_ORDER.map((category) => (
+          <button
+            key={category}
+            type="button"
+            onClick={() => setCategoryFilter(category)}
+            className={`rounded-lg px-2 py-1 text-xs ${
+              categoryFilter === category ? 'bg-blue-500/25 text-blue-100' : 'bg-slate-800 text-slate-400 hover:text-white'
+            }`}
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <span className={`size-2 rounded-full ${highlightCategoryColorClass(category)}`} />
+              {HIGHLIGHT_CATEGORY_LABELS[category]} ({categoryCounts[category]})
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {highlights.length === 0 ? (
         <p className="rounded-xl border border-dashed border-slate-700 px-3 py-8 text-center text-sm leading-5 text-slate-400">
           Select PDF text to create a highlight.
         </p>
       ) : (
-        <div className="space-y-2.5">
-          {sortedHighlights.map((highlight) => (
-            <div
-              key={highlight.id}
-              className="group rounded-xl border border-slate-700/80 bg-slate-800/45 p-3 transition-colors hover:border-slate-600 hover:bg-slate-800/80"
-            >
-              <button
-                type="button"
-                title={highlight.text}
-                onClick={() => onNavigate(highlight)}
-                className="block w-full text-left"
-              >
-                <span className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                  <span
-                    className={`size-2.5 rounded-full ${
-                      highlight.color === 'yellow'
-                        ? 'bg-yellow-400'
-                        : highlight.color === 'green'
-                          ? 'bg-green-400'
-                          : 'bg-blue-400'
-                    }`}
-                  />
-                  Page {highlight.pageNumber}
-                </span>
-                <span className="mt-2 line-clamp-3 block text-sm leading-5 text-slate-100">
-                  {highlight.text}
-                </span>
-                <span className="mt-2 block text-[11px] text-slate-500">
-                  {new Date(highlight.createdDate).toLocaleString()}
-                </span>
-              </button>
-              <button
-                type="button"
-                aria-label={`Remove highlight from page ${highlight.pageNumber}`}
-                onClick={() => onRemove(highlight.id)}
-                className="mt-2 rounded-lg px-2 py-1 text-xs text-red-300 opacity-70 hover:bg-red-500/15 hover:opacity-100"
-              >
-                Remove
-              </button>
-            </div>
-          ))}
+        <div className="space-y-3">
+          {visibleCategories.map((category) => {
+            const categoryHighlights = highlights.filter(
+              (highlight) => highlight.category === category,
+            )
+            const pageGroups = groupHighlightsByPage(categoryHighlights)
+            const categoryCollapsed = collapsedCategories.has(category)
+            return (
+              <section key={category} className="rounded-xl border border-slate-700/70 bg-slate-950/20">
+                <button
+                  type="button"
+                  onClick={() => toggleCategory(category)}
+                  className="flex w-full items-center justify-between px-3 py-2.5 text-left text-sm font-semibold text-slate-200 hover:bg-slate-800/60"
+                >
+                  <span className="flex items-center gap-2">
+                    <span className={`size-2.5 rounded-full ${highlightCategoryColorClass(category)}`} />
+                    {HIGHLIGHT_CATEGORY_LABELS[category]} ({categoryHighlights.length})
+                  </span>
+                  <span className={`text-xs transition-transform ${categoryCollapsed ? '' : 'rotate-90'}`}>&#9654;</span>
+                </button>
+                {!categoryCollapsed ? (
+                  <div className="space-y-2 border-t border-slate-700/60 p-2">
+                    {pageGroups.length === 0 ? (
+                      <p className="px-2 py-3 text-center text-xs text-slate-500">No highlights</p>
+                    ) : pageGroups.map(([pageNumber, pageHighlights]) => {
+                      const pageKey = `${category}:${pageNumber}`
+                      const pageCollapsed = collapsedPages.has(pageKey)
+                      return (
+                        <div key={pageKey} className="rounded-lg bg-slate-900/55">
+                          <button
+                            type="button"
+                            onClick={() => togglePage(pageKey)}
+                            className="flex w-full items-center justify-between px-2.5 py-2 text-left text-xs font-semibold text-slate-300 hover:text-white"
+                          >
+                            <span>Page {pageNumber}</span>
+                            <span>{pageHighlights.length}</span>
+                          </button>
+                          {!pageCollapsed ? (
+                            <div className="space-y-1.5 px-1.5 pb-1.5">
+                              {pageHighlights.map((highlight) => (
+                                <div
+                                  key={highlight.id}
+                                  onContextMenu={(event) => onContextMenu(event, highlight.id)}
+                                  className="group rounded-lg border border-slate-700/70 bg-slate-800/55 p-2.5 hover:border-slate-600 hover:bg-slate-800"
+                                >
+                                  <label className="mb-2 flex items-center gap-2 text-[10px] text-slate-500">
+                                    <input
+                                      type="checkbox"
+                                      checked={selectedHighlightIds.has(highlight.id)}
+                                      onChange={() => onToggleSelected(highlight.id)}
+                                    />
+                                    Select for export
+                                  </label>
+                                  <button
+                                    type="button"
+                                    title={highlight.text}
+                                    onClick={() => onNavigate(highlight)}
+                                    className="block w-full text-left"
+                                  >
+                                    <span className="flex items-center gap-2">
+                                      <span className={`size-2.5 shrink-0 rounded-full ${highlightColorClass(highlight.color)}`} />
+                                      <span className="line-clamp-3 text-sm leading-5 text-slate-100">{highlight.text}</span>
+                                    </span>
+                                    <span className="mt-1.5 block text-[10px] text-slate-500">
+                                      {new Date(highlight.createdDate).toLocaleString()}
+                                    </span>
+                                  </button>
+                                  {editingNoteId === highlight.id ? (
+                                    <HighlightNoteEditor
+                                      highlight={highlight}
+                                      onSave={onSaveNote}
+                                      onDone={onFinishNote}
+                                    />
+                                  ) : highlight.note ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => onEditNote(highlight.id)}
+                                      className="mt-2 block w-full rounded-lg border border-slate-700/70 bg-slate-950/45 px-2.5 py-2 text-left text-xs leading-5 text-slate-300 hover:border-slate-600"
+                                    >
+                                      <span className="mr-1" aria-hidden="true">&#128221;</span>
+                                      <span className="line-clamp-3">{highlight.note}</span>
+                                    </button>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => onEditNote(highlight.id)}
+                                      className="mt-2 rounded px-1.5 py-1 text-[10px] text-blue-300 hover:bg-blue-500/10"
+                                    >
+                                      Add Note
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    aria-label={`Delete highlight from page ${highlight.pageNumber}`}
+                                    onClick={() => onRemove(highlight.id)}
+                                    className="mt-1 rounded px-1.5 py-0.5 text-[10px] text-red-300 opacity-60 hover:bg-red-500/15 hover:opacity-100"
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : null}
+              </section>
+            )
+          })}
         </div>
       )}
+    </div>
+  )
+}
+
+function HighlightNoteEditor({
+  highlight,
+  onSave,
+  onDone,
+}: {
+  highlight: PdfHighlight
+  onSave: (highlightId: string, note: string) => void
+  onDone: () => void
+}) {
+  const [note, setNote] = useState(highlight.note)
+  const saveTimerRef = useRef(0)
+  const lastSavedNoteRef = useRef(highlight.note)
+
+  useEffect(() => () => window.clearTimeout(saveTimerRef.current), [])
+
+  function scheduleSave(nextNote: string) {
+    window.clearTimeout(saveTimerRef.current)
+    saveTimerRef.current = window.setTimeout(() => persistNote(nextNote), 500)
+  }
+
+  function saveNow() {
+    window.clearTimeout(saveTimerRef.current)
+    persistNote(note)
+  }
+
+  function persistNote(nextNote: string) {
+    const normalizedNote = nextNote.trimEnd()
+    if (normalizedNote === lastSavedNoteRef.current) {
+      return
+    }
+    lastSavedNoteRef.current = normalizedNote
+    onSave(highlight.id, normalizedNote)
+  }
+
+  return (
+    <div className="mt-2 rounded-lg border border-blue-400/40 bg-slate-950/70 p-2">
+      <label className="text-[10px] font-semibold uppercase tracking-wide text-blue-300">
+        Personal Note
+        <textarea
+          data-note-editor={highlight.id}
+          value={note}
+          rows={4}
+          placeholder="Add a research note..."
+          onChange={(event) => {
+            setNote(event.target.value)
+            scheduleSave(event.target.value)
+          }}
+          onBlur={saveNow}
+          onKeyDown={(event) => {
+            if (event.ctrlKey && event.key === 'Enter') {
+              event.preventDefault()
+              saveNow()
+              event.currentTarget.blur()
+            }
+          }}
+          className="mt-1.5 w-full resize-y rounded-md border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs font-normal leading-5 text-slate-100 outline-none focus:border-blue-400"
+        />
+      </label>
+      <div className="mt-1 flex items-center justify-between text-[10px] text-slate-500">
+        <span>Autosaves while typing. Ctrl+Enter to save.</span>
+        <button
+          type="button"
+          onClick={() => {
+            saveNow()
+            onDone()
+          }}
+          className="rounded px-2 py-1 text-blue-300 hover:bg-blue-500/10"
+        >
+          Done
+        </button>
+      </div>
     </div>
   )
 }
@@ -3642,6 +4340,58 @@ function getErrorMessage(error: unknown) {
   return String(error)
 }
 
+function groupHighlightsByPage(highlights: PdfHighlight[]) {
+  const groups = new Map<number, PdfHighlight[]>()
+  for (const highlight of [...highlights].sort(
+    (left, right) => Date.parse(right.createdDate) - Date.parse(left.createdDate),
+  )) {
+    const pageHighlights = groups.get(highlight.pageNumber) ?? []
+    pageHighlights.push(highlight)
+    groups.set(highlight.pageNumber, pageHighlights)
+  }
+  return [...groups.entries()].sort(([leftPage], [rightPage]) => leftPage - rightPage)
+}
+
+function toggleSetValue<T>(current: Set<T>, value: T) {
+  const next = new Set(current)
+  if (next.has(value)) {
+    next.delete(value)
+  } else {
+    next.add(value)
+  }
+  return next
+}
+
+function highlightColorClass(color: HighlightColor) {
+  return color === 'yellow'
+    ? 'bg-amber-300'
+    : color === 'green'
+      ? 'bg-emerald-300'
+      : color === 'blue'
+        ? 'bg-sky-300'
+        : 'bg-violet-300'
+}
+
+function highlightColorSwatchClass(color: HighlightColor) {
+  return color === 'yellow'
+    ? 'border-amber-100 bg-amber-300'
+    : color === 'green'
+      ? 'border-emerald-100 bg-emerald-300'
+      : color === 'blue'
+        ? 'border-sky-100 bg-sky-300'
+        : 'border-violet-100 bg-violet-300'
+}
+
+function highlightCategoryColorClass(category: HighlightCategory) {
+  return category === 'important'
+    ? 'bg-yellow-400'
+    : category === 'research'
+      ? 'bg-green-400'
+      : category === 'reference'
+        ? 'bg-blue-400'
+        : 'bg-violet-400'
+}
+
 function getPdfPageElement(node: Node) {
   const element = node instanceof Element ? node : node.parentElement
   return element?.closest<HTMLElement>('.react-pdf__Page') ?? null
@@ -3658,6 +4408,10 @@ function rectanglesOverlap(left: HighlightRectangle, right: HighlightRectangle) 
     left.y < right.y + right.height &&
     left.y + left.height > right.y
   )
+}
+
+function normalizeHighlightText(text: string) {
+  return text.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
 }
 
 function pointInsideRectangle(

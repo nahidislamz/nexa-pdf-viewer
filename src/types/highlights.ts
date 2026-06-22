@@ -1,4 +1,5 @@
-export type HighlightColor = 'yellow' | 'green' | 'blue'
+export type HighlightColor = 'yellow' | 'green' | 'blue' | 'purple'
+export type HighlightCategory = 'important' | 'research' | 'reference' | 'question'
 
 export type HighlightRectangle = {
   x: number
@@ -12,6 +13,8 @@ export type PdfHighlight = {
   pageNumber: number
   text: string
   color: HighlightColor
+  category: HighlightCategory
+  note: string
   rectangles: HighlightRectangle[]
   rotation: number
   createdDate: string

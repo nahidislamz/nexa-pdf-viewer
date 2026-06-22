@@ -20,7 +20,9 @@ type PdfHighlight = {
   id: string
   pageNumber: number
   text: string
-  color: 'yellow' | 'green' | 'blue'
+  color: 'yellow' | 'green' | 'blue' | 'purple'
+  category: 'important' | 'research' | 'reference' | 'question'
+  note: string
   rectangles: Array<{ x: number; y: number; width: number; height: number }>
   rotation: number
   createdDate: string
@@ -43,6 +45,11 @@ declare global {
         identity: { id: string; fileSize: number; modifiedAt: number },
         highlights: PdfHighlight[],
       ) => Promise<PdfHighlight[]>
+      exportHighlights: (options: {
+        id: string
+        format: 'markdown' | 'text' | 'docx'
+        highlights: PdfHighlight[]
+      }) => Promise<string | null>
       printPdf: (id: string) => Promise<{ printed: boolean; cancelled: boolean }>
       exportPage: (exportData: {
         data: Uint8Array
