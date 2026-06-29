@@ -1,4 +1,17 @@
-import type { PropsWithChildren, ReactNode } from 'react'
+import type { ReactNode } from 'react'
+import {
+  ArrowRotateClockwiseRegular,
+  ArrowRotateCounterclockwiseRegular,
+  ChevronLeftRegular,
+  ChevronRightRegular,
+  DismissRegular,
+  DocumentPdfRegular,
+  PanelLeftRegular,
+  SearchRegular,
+  ZoomFitRegular,
+  ZoomInRegular,
+  ZoomOutRegular,
+} from '@fluentui/react-icons'
 
 type PdfPaneHeaderProps = {
   active: boolean
@@ -57,7 +70,7 @@ export function PdfPaneHeader({
       >
         {paneLabel}
       </span>
-      <FileIcon />
+      <DocumentPdfRegular className="size-4 shrink-0 text-slate-500" />
       <span
         title={fileName ?? 'No document assigned'}
         className={`min-w-0 flex-1 truncate font-medium ${fileName ? '' : 'italic text-slate-500'}`}
@@ -80,7 +93,7 @@ export function PdfPaneHeader({
           title="Close split view"
           aria-label="Close split view"
         >
-          <CloseIcon />
+          <DismissRegular className="size-4" />
         </button>
       ) : null}
     </header>
@@ -116,7 +129,7 @@ export function PdfPaneToolbar({
       }`}
     >
       <IconButton title="Previous page" disabled={currentPage <= 1} onClick={onPreviousPage}>
-        <PreviousIcon />
+        <ChevronLeftRegular className="size-4" />
       </IconButton>
       <input
         value={pageInput}
@@ -131,33 +144,33 @@ export function PdfPaneToolbar({
         className="h-8 w-12 rounded-md border border-slate-700 bg-slate-950 px-1 text-center text-slate-200 tabular-nums outline-none hover:border-slate-600 focus:border-blue-400"
       />
       <IconButton title="Next page" disabled={currentPage >= totalPages} onClick={onNextPage}>
-        <NextIcon />
+        <ChevronRightRegular className="size-4" />
       </IconButton>
       <ToolbarDivider />
       <IconButton title="Zoom out" onClick={onZoomOut}>
-        <ZoomOutIcon />
+        <ZoomOutRegular className="size-4" />
       </IconButton>
       <button type="button" className="split-pane-button min-w-14 tabular-nums" onClick={onResetZoom} title="Reset zoom">
         {zoomPercent}%
       </button>
       <IconButton title="Zoom in" onClick={onZoomIn}>
-        <ZoomInIcon />
+        <ZoomInRegular className="size-4" />
       </IconButton>
       <IconButton title="Fit width" active={fitActive} onClick={onFitWidth}>
-        <FitWidthIcon />
+        <ZoomFitRegular className="size-4" />
       </IconButton>
       <ToolbarDivider />
       <IconButton title="Rotate left" onClick={onRotateLeft}>
-        <RotateLeftIcon />
+        <ArrowRotateCounterclockwiseRegular className="size-4" />
       </IconButton>
       <IconButton title="Rotate right" onClick={onRotateRight}>
-        <RotateRightIcon />
+        <ArrowRotateClockwiseRegular className="size-4" />
       </IconButton>
       <IconButton title="Search" active={searchActive} onClick={onSearch}>
-        <SearchIcon />
+        <SearchRegular className="size-4" />
       </IconButton>
       <IconButton title="Toggle panels" active={panelsActive} onClick={onTogglePanels}>
-        <PanelsIcon />
+        <PanelLeftRegular className="size-4" />
       </IconButton>
     </div>
   )
@@ -192,58 +205,4 @@ function IconButton({
 
 function ToolbarDivider() {
   return <span aria-hidden="true" className="mx-1 h-5 w-px shrink-0 bg-slate-700" />
-}
-
-type IconProps = { className?: string }
-
-function Icon({ children, className = '' }: PropsWithChildren<IconProps>) {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className={`size-4 shrink-0 fill-none stroke-current stroke-2 ${className}`}>
-      {children}
-    </svg>
-  )
-}
-
-function FileIcon() {
-  return <Icon className="text-slate-500"><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5" /></Icon>
-}
-
-function CloseIcon() {
-  return <Icon><path d="m7 7 10 10M17 7 7 17" /></Icon>
-}
-
-function PreviousIcon() {
-  return <Icon><path d="m15 18-6-6 6-6" /></Icon>
-}
-
-function NextIcon() {
-  return <Icon><path d="m9 18 6-6-6-6" /></Icon>
-}
-
-function ZoomOutIcon() {
-  return <Icon><circle cx="10.5" cy="10.5" r="6.5" /><path d="M15.5 15.5 21 21M7.5 10.5h6" /></Icon>
-}
-
-function ZoomInIcon() {
-  return <Icon><circle cx="10.5" cy="10.5" r="6.5" /><path d="M15.5 15.5 21 21M7.5 10.5h6M10.5 7.5v6" /></Icon>
-}
-
-function FitWidthIcon() {
-  return <Icon><path d="M4 6v12M20 6v12M8 12h8M8 12l3-3M8 12l3 3M16 12l-3-3M16 12l-3 3" /></Icon>
-}
-
-function RotateLeftIcon() {
-  return <Icon><path d="M4 8V3m0 0h5M4 3l4 4a8 8 0 1 1-2 8" /></Icon>
-}
-
-function RotateRightIcon() {
-  return <Icon><path d="M20 8V3m0 0h-5m5 0-4 4a8 8 0 1 0 2 8" /></Icon>
-}
-
-function SearchIcon() {
-  return <Icon><circle cx="10.5" cy="10.5" r="6.5" /><path d="M15.5 15.5 21 21" /></Icon>
-}
-
-function PanelsIcon() {
-  return <Icon><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16M12 8h6M12 12h6M12 16h4" /></Icon>
 }

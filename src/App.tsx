@@ -3,23 +3,35 @@ import { Document, Page, Thumbnail, pdfjs } from 'react-pdf'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import {
   AddRegular,
+  ArrowExportRegular,
   ArrowLeftRegular,
   ArrowRightRegular,
+  ArrowRotateClockwiseRegular,
+  ArrowRotateCounterclockwiseRegular,
   BookOpenRegular,
+  BookmarkRegular,
   CalendarRegular,
   CheckboxCheckedRegular,
   ChevronDownRegular,
+  ChevronLeftRegular,
+  ChevronRightRegular,
+  CollectionsRegular,
   DarkThemeRegular,
+  DocumentBulletListRegular,
+  DocumentOnePageRegular,
   DocumentPdfRegular,
   FullScreenMaximizeRegular,
   FullScreenMinimizeRegular,
   HighlightRegular,
   HistoryRegular,
+  InfoRegular,
+  LibraryRegular,
   MoreHorizontalRegular,
   OpenFolderRegular,
   PanelLeftRegular,
   PenRegular,
   PrintRegular,
+  QuestionCircleRegular,
   SaveRegular,
   SearchRegular,
   SignatureRegular,
@@ -8307,336 +8319,147 @@ function StatusItem({ children }: { children: React.ReactNode }) {
 }
 
 function PdfToolsIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4 shrink-0" fill="none" aria-hidden="true">
-      <path d="M5 4.5h8l4 4V19a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 4 19V6A1.5 1.5 0 0 1 5.5 4.5Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
-      <path d="M13 4.5V9h4M8 13h5M8 16h8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <DocumentPdfRegular className="size-4 shrink-0" />
 }
 
 function MergePdfIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4 shrink-0 text-blue-300" fill="none" aria-hidden="true">
-      <path d="M6 4.5h6l3 3V16H6V4.5ZM12 4.5V8h3" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-      <path d="M9 18.5h9V10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M8.5 11h4M8.5 13.5h4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  )
+  return <DocumentPdfRegular className="size-4 shrink-0 text-blue-300" />
 }
 
 function ImagesToPdfIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4 shrink-0 text-emerald-300" fill="none" aria-hidden="true">
-      <rect x="4" y="5" width="16" height="13.5" rx="2" stroke="currentColor" strokeWidth="1.6" />
-      <path d="m6.8 16 3.2-3.3 2.3 2.2 2.1-2.8 2.8 3.9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-      <circle cx="9" cy="9" r="1.2" fill="currentColor" />
-    </svg>
-  )
+  return <DocumentOnePageRegular className="size-4 shrink-0 text-emerald-300" />
 }
 
 function SignatureToolIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4 shrink-0 text-amber-300" fill="none" aria-hidden="true">
-      <path d="M14.5 4.5 19 9 9.7 18.3 5 19l.7-4.7 8.8-9.8Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-      <path d="M13 6.3 17.2 10.5M4 21h16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  )
+  return <SignatureRegular className="size-4 shrink-0 text-amber-300" />
 }
 
 function SignedCopyIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4 shrink-0 text-emerald-300" fill="none" aria-hidden="true">
-      <path d="M6 3.5h8l4 4V20a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 5 20V5A1.5 1.5 0 0 1 6.5 3.5Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-      <path d="M14 3.5V8h4" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-      <path d="m8 15 2.3 2.3L16 11.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <SaveRegular className="size-4 shrink-0 text-emerald-300" />
 }
 
 function CalendarIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4" fill="none" aria-hidden="true">
-      <rect x="4" y="5.5" width="16" height="14" rx="2" stroke="currentColor" strokeWidth="1.7" />
-      <path d="M8 3.5v4M16 3.5v4M4 10h16M8 14h2M12 14h2M16 14h1" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  )
+  return <CalendarRegular className="size-4" />
 }
 
 function CheckBoxIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4" fill="none" aria-hidden="true">
-      <rect x="4.5" y="4.5" width="15" height="15" rx="2" stroke="currentColor" strokeWidth="1.8" />
-      <path d="m8 12 3 3 5-6" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <CheckboxCheckedRegular className="size-4" />
 }
 
 function DateFormatIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4" fill="none" aria-hidden="true">
-      <rect x="4" y="5" width="16" height="15" rx="2" stroke="currentColor" strokeWidth="1.7" />
-      <path d="M8 3.5v3M16 3.5v3M4 9h16M7.5 13h3M13.5 13H16M7.5 16h5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  )
+  return <CalendarRegular className="size-4" />
 }
 
 function ChevronDownIcon({ open }: { open: boolean }) {
-  return (
-    <svg viewBox="0 0 20 20" className={`size-3 shrink-0 text-slate-500 transition-transform duration-150 ${open ? 'rotate-180' : ''}`} fill="none" aria-hidden="true">
-      <path d="m5 7.5 5 5 5-5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <ChevronDownRegular className={`size-3 shrink-0 text-slate-500 transition-transform duration-150 ${open ? 'rotate-180' : ''}`} />
 }
 
 function WorkspaceIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5 shrink-0" fill="none" aria-hidden="true">
-      <path d="M3.5 7.5h6l1.7 2h9.3v9.5a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 19V7.5Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
-      <path d="M5.5 7.5V5A1.5 1.5 0 0 1 7 3.5h4l1.5 2H18A1.5 1.5 0 0 1 19.5 7v2.5" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
-    </svg>
-  )
+  return <CollectionsRegular className="size-5 shrink-0" />
 }
 
 function ReferencesIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5 shrink-0" fill="none" aria-hidden="true">
-      <path d="M5 4.5h11.5A2.5 2.5 0 0 1 19 7v12.5H7.5A2.5 2.5 0 0 1 5 17V4.5Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
-      <path d="M5 17a2.5 2.5 0 0 1 2.5-2.5H19M9 8h6M9 11h4" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  )
+  return <DocumentBulletListRegular className="size-5 shrink-0" />
 }
 
 function PreviousPageIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="m15 5-7 7 7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <ChevronLeftRegular className="size-5" />
 }
 
 function NextPageIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="m9 5 7 7-7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <ChevronRightRegular className="size-5" />
 }
 
 function SidebarToggleIcon({ expanded }: { expanded: boolean }) {
-  return (
-    <svg viewBox="0 0 20 20" className="size-4" fill="none" aria-hidden="true">
-      <path
-        d={expanded ? 'm12.5 5-5 5 5 5' : 'm7.5 5 5 5-5 5'}
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  )
+  return expanded ? <ChevronLeftRegular className="size-4" /> : <ChevronRightRegular className="size-4" />
 }
 
 function ZoomOutIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <circle cx="10.5" cy="10.5" r="6.5" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M7.5 10.5h6M15.3 15.3 21 21" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-    </svg>
-  )
+  return <ZoomOutRegular className="size-5" />
 }
 
 function ZoomInIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <circle cx="10.5" cy="10.5" r="6.5" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M7.5 10.5h6M10.5 7.5v6M15.3 15.3 21 21" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-    </svg>
-  )
+  return <ZoomInRegular className="size-5" />
 }
 
 function FitWidthIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="M3 5v14M21 5v14M7 12h10M7 12l3-3M7 12l3 3M17 12l-3-3M17 12l-3 3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <ZoomFitRegular className="size-5" />
 }
 
 function SinglePageIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <rect x="5" y="3" width="14" height="18" rx="1.5" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M8 7h8M8 10h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
-  )
+  return <DocumentOnePageRegular className="size-5" />
 }
 
 function ContinuousScrollIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <rect x="6" y="2.5" width="12" height="8" rx="1" stroke="currentColor" strokeWidth="1.6" />
-      <rect x="6" y="13.5" width="12" height="8" rx="1" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M12 9v6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  )
+  return <DocumentBulletListRegular className="size-5" />
 }
 
 function BackgroundIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4 shrink-0" fill="none" aria-hidden="true">
-      <circle cx="12" cy="12" r="8.5" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M12 3.5a8.5 8.5 0 0 0 0 17v-17Z" fill="currentColor" opacity=".65" />
-    </svg>
-  )
+  return <DarkThemeRegular className="size-4 shrink-0" />
 }
 
 function RotateLeftIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="M5 8V3m0 0h5M5 3l3.2 3.2A8 8 0 1 1 4 13" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <ArrowRotateCounterclockwiseRegular className="size-5" />
 }
 
 function RotateRightIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="M19 8V3m0 0h-5m5-0-3.2 3.2A8 8 0 1 0 20 13" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <ArrowRotateClockwiseRegular className="size-5" />
 }
 
 function SearchIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <circle cx="10.5" cy="10.5" r="6.5" stroke="currentColor" strokeWidth="1.8" />
-      <path d="m15.3 15.3 5.2 5.2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-    </svg>
-  )
+  return <SearchRegular className="size-5" />
 }
 
 function GlobalSearchIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="size-4 fill-none stroke-current stroke-2">
-      <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H14v9H6.5A2.5 2.5 0 0 0 4 14.5z" />
-      <path d="M4 5.5v9A2.5 2.5 0 0 0 6.5 17H10M8 6h3M8 9h3" />
-      <circle cx="16" cy="16" r="3.5" />
-      <path d="m18.7 18.7 2.3 2.3" />
-    </svg>
-  )
+  return <LibraryRegular className="size-4" />
 }
 
 function ThumbnailsIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <rect x="3" y="4" width="5" height="16" rx="1" stroke="currentColor" strokeWidth="1.8" />
-      <rect x="11" y="4" width="10" height="7" rx="1" stroke="currentColor" strokeWidth="1.8" />
-      <rect x="11" y="14" width="10" height="6" rx="1" stroke="currentColor" strokeWidth="1.8" />
-    </svg>
-  )
+  return <DocumentOnePageRegular className="size-5" />
 }
 
 function BookmarkIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="M6 4.5A1.5 1.5 0 0 1 7.5 3h9A1.5 1.5 0 0 1 18 4.5V21l-6-3.8L6 21V4.5Z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
-    </svg>
-  )
+  return <BookmarkRegular className="size-5" />
 }
 
 function HighlightsIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path
-        d="m5 15 7.8-7.8 4 4L9 19H5v-4ZM14.5 5.5l1.8-1.8a1.4 1.4 0 0 1 2 0l2 2a1.4 1.4 0 0 1 0 2l-1.8 1.8-4-4Z"
-        stroke="currentColor"
-        strokeWidth="1.7"
-        strokeLinejoin="round"
-      />
-      <path d="M4 21h16" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  )
+  return <HighlightRegular className="size-5" />
 }
 
 function InfoIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M12 10.5V17M12 7.2v.1" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-    </svg>
-  )
+  return <InfoRegular className="size-5" />
 }
 
 function HelpIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M9.8 9a2.4 2.4 0 1 1 3.4 2.2c-.8.4-1.2.9-1.2 1.8v.2M12 17.2v.1" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-    </svg>
-  )
+  return <QuestionCircleRegular className="size-5" />
 }
 
 function PrintIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="M7 9V3h10v6M7 17H5a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
-      <path d="M7 14h10v7H7v-7Z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
-      <path d="M17.5 12h.01" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
-    </svg>
-  )
+  return <PrintRegular className="size-5" />
 }
 
 function ExportIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="M12 3v12M7.5 7.5 12 3l4.5 4.5M5 14v6h14v-6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <ArrowExportRegular className="size-5" />
 }
 
 function FileIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-4 shrink-0 text-blue-300" fill="none" aria-hidden="true">
-      <path d="M6 3h8l4 4v14H6V3Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
-      <path d="M14 3v5h4M9 13h6M9 16h6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
-  )
+  return <DocumentPdfRegular className="size-4 shrink-0 text-blue-300" />
 }
 
 function FullscreenIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <FullScreenMaximizeRegular className="size-5" />
 }
 
 function SplitViewIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
-      <rect x="3" y="4" width="18" height="16" rx="2" />
-      <path d="M12 4v16" />
-      <path d="m9 10-2 2 2 2M15 10l2 2-2 2" />
-    </svg>
-  )
+  return <SplitHorizontalRegular className="size-5" />
 }
 
 function ExitFullscreenIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
-      <path d="M4 9h5V4M20 9h-5V4M4 15h5v5M20 15h-5v5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <FullScreenMinimizeRegular className="size-5" />
 }
 
 function DropPdfIcon() {
-  return (
-    <svg viewBox="0 0 32 32" className="size-9" fill="none" aria-hidden="true">
-      <path d="M8 3h11l6 6v20H8V3Z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
-      <path d="M19 3v7h6M16 14v10M12 20l4 4 4-4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
+  return <DocumentPdfRegular className="size-9" />
 }
 
 function getErrorMessage(error: unknown) {
