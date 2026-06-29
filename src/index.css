@@ -2,6 +2,67 @@
 @tailwind components;
 @tailwind utilities;
 
+@layer components {
+  .workspace-primary-button {
+    @apply rounded-lg bg-blue-500 px-3 py-2 text-xs font-semibold text-white transition-colors duration-150 hover:bg-blue-400 disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .workspace-secondary-button {
+    @apply rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 transition-colors duration-150 hover:border-slate-600 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .workspace-danger-button {
+    @apply rounded-lg border border-red-900/70 px-3 py-2 text-xs font-semibold text-red-300 transition-colors duration-150 hover:bg-red-950/60 disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .merge-tool-button {
+    @apply rounded-md border border-slate-700 px-2 py-1 text-[10px] font-semibold text-slate-300 transition-colors duration-150 hover:border-slate-500 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .workspace-card {
+    @apply overflow-hidden rounded-2xl border border-slate-700 bg-slate-900/70;
+  }
+  .workspace-card-header {
+    @apply flex h-11 items-center justify-between border-b border-slate-700 px-4 text-sm font-semibold text-slate-100;
+  }
+  .workspace-card-header span {
+    @apply rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400;
+  }
+  .reference-label {
+    @apply block text-[10px] font-bold uppercase tracking-wide text-slate-500;
+  }
+}
+
+@layer components {
+  .split-pane-button {
+    @apply inline-flex h-8 min-w-8 items-center justify-center rounded-md border border-slate-700 px-2 text-slate-300 transition-colors duration-150 hover:border-slate-500 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-35;
+  }
+
+  .split-pane-button-active {
+    @apply border-blue-400/70 bg-blue-500/15 text-blue-200;
+  }
+
+  .dashboard-button {
+    @apply inline-flex h-8 items-center justify-center rounded-lg border border-slate-700 px-2.5 text-xs font-medium text-slate-300 hover:border-slate-500 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-35;
+  }
+
+  .dashboard-danger {
+    @apply text-red-200 hover:border-red-500/50 hover:bg-red-500/15;
+  }
+
+  .dashboard-input {
+    @apply w-full rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-2 text-xs text-slate-200 outline-none placeholder:text-slate-600 hover:border-slate-600 focus:border-blue-400;
+  }
+
+  .dashboard-compact-select {
+    @apply h-8 rounded-lg border border-slate-700 bg-slate-900 px-2 text-xs text-slate-200 outline-none hover:border-slate-500 focus:border-blue-400 disabled:opacity-35;
+  }
+
+  .dashboard-segment {
+    @apply rounded-lg border border-transparent px-1 py-2 text-[10px] font-semibold text-slate-500 hover:bg-slate-800 hover:text-slate-200;
+  }
+
+  .dashboard-segment-active {
+    @apply border-blue-400/50 bg-blue-500/15 text-blue-200;
+  }
+}
+
 :root {
   color-scheme: dark;
   font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
@@ -104,4 +165,32 @@ input:focus-visible {
 
 .highlight-pulse {
   animation: highlight-pulse 1s ease-out;
+}
+
+.signature-opacity-slider {
+  height: 0.35rem;
+  cursor: pointer;
+  appearance: none;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgb(125 211 252 / 0.45), rgb(14 165 233));
+  outline: none;
+}
+
+.signature-opacity-slider::-webkit-slider-thumb {
+  width: 0.9rem;
+  height: 0.9rem;
+  appearance: none;
+  border-radius: 999px;
+  background: #e0f2fe;
+  border: 2px solid #0ea5e9;
+  box-shadow: 0 1px 5px rgb(2 6 23 / 0.35);
+}
+
+.signature-opacity-slider::-moz-range-thumb {
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 999px;
+  background: #e0f2fe;
+  border: 2px solid #0ea5e9;
+  box-shadow: 0 1px 5px rgb(2 6 23 / 0.35);
 }

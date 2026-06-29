@@ -1,7 +1,7 @@
 {
   "name": "next-pdf-viewer",
   "private": true,
-  "version": "2.2.0",
+  "version": "2.9.7",
   "productName": "Next PDF Viewer",
   "description": "Modern desktop PDF reader built with Electron, React, TypeScript, Vite, and PDF.js.",
   "author": "Nexa Nest LTD",
@@ -14,9 +14,12 @@
     "build": "tsc -b && vite build",
     "dist": "npm run build && node scripts/build-electron.cjs",
     "lint": "eslint .",
+    "test:search": "node scripts/test-search-index.mjs",
+    "test:references": "node scripts/test-references.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
+    "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^5.4.296",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
@@ -54,6 +57,8 @@
       "dist",
       "electron/main.js",
       "electron/preload.js",
+      "electron/search-index.js",
+      "electron/references.js",
       "package.json"
     ],
     "extraResources": [

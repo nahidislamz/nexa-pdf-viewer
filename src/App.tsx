@@ -2,6 +2,24 @@ import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } fro
 import { Document, Page, Thumbnail, pdfjs } from 'react-pdf'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { HighlightOverlay } from './components/Viewer/HighlightOverlay'
+import { HighlightSelectionToolbar } from './components/Viewer/HighlightSelectionToolbar'
+import { FillSignOverlay } from './components/Viewer/FillSignOverlay'
+import { SignaturePlacementOverlay } from './components/Viewer/SignaturePlacementOverlay'
+import { GlobalHighlightsDashboard } from './components/Highlights/GlobalHighlightsDashboard'
+import { GlobalSearchPanel } from './components/Search/GlobalSearchPanel'
+import { WorkspaceManager } from './components/Workspaces/WorkspaceManager'
+import { ReferenceDashboard } from './components/References/ReferenceDashboard'
+import { MergePdfsPanel } from './components/PdfTools/MergePdfsPanel'
+import { ImagesToPdfPanel } from './components/PdfTools/ImagesToPdfPanel'
+import { SignatureManagerPanel } from './components/PdfTools/SignatureManagerPanel'
+import {
+  SplitDocumentPane,
+  type SplitDocumentPaneHandle,
+  type SplitPaneDocument,
+  type SplitPaneState,
+  type SplitScrollPosition,
+} from './components/SplitView/SplitDocumentPane'
+import { PdfPaneHeader, PdfPaneToolbar } from './components/SplitView/PdfPaneChrome'
 import type {
   HighlightColor,
   HighlightCategory,
@@ -10,6 +28,20 @@ import type {
   PendingHighlightSelection,
 } from './types/highlights'
 import { transformHighlightRectangle } from './utils/highlights'
+import type { HighlightLibrary, HighlightLibraryEntry } from './types/highlightLibrary'
+import { indexPdfForGlobalSearch } from './services/globalSearchIndexer'
+import { extractAndStoreReference } from './services/referenceExtractor'
+import type { GlobalSearchResponse, GlobalSearchResult } from './types/globalSearch'
+import { EMPTY_GLOBAL_SEARCH_RESPONSE } from './types/globalSearch'
+import type { WorkspaceDetails, WorkspaceSummary } from './types/workspaces'
+import type { ReferenceQueryResponse } from './types/references'
+import type {
+  FillSignDateFormat,
+  FillSignField,
+  FillSignTool,
+  SavedSignature,
+  SignaturePlacement,
+} from './types/signatures'
 import 'react-pdf/dist/Page/TextLayer.css'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 
@@ -35,6 +67,8 @@ type OpenedPdf = PdfFile & {
     rotation: number
   }
   highlights: PdfHighlight[]
+  signaturePlacements: SignaturePlacement[]
+  fillSignFields: FillSignField[]
 }
 
 type SystemPdfOpenMessage =
@@ -62,6 +96,38 @@ type SearchMatch = {
 type SidebarTab = 'thumbnails' | 'bookmarks' | 'highlights' | 'info'
 type ViewMode = 'continuous' | 'single'
 type ViewerBackground = 'dark-gray' | 'black' | 'light-gray' | 'white'
+type PaneSide = 'left' | 'right'
+type WorkspaceSession = Awaited<ReturnType<Window['electronAPI']['getWorkspace']>>
+type WorkspaceNavigationOptions = { highlight?: HighlightLibraryEntry; workspaceId?: string }
+
+type PdfTabState = {
+  page: number
+  pageOffset: number
+  zoom: number
+  fitMode: boolean
+  rotation: number
+  searchOpen: boolean
+  searchQuery: string
+  selectedMatchIndex: number
+  sidebarOpen: boolean
+  sidebarTab: SidebarTab
+  sidebarWidth: number
+}
+
+type PdfTab = {
+  tabId: string
+  documentId: string
+  name: string
+  state: PdfTabState
+}
+
+type PaneAssignment = {
+  id: PaneSide
+  tabId: string | null
+  documentId: string | null
+  fileName: string | null
+  state: PdfTabState | null
+}
 
 type PdfOutlineItem = {
   title: string
@@ -129,15 +195,24 @@ const HIGHLIGHT_COLOR_LABELS: Record<HighlightColor, string> = {
   purple: 'Purple',
 }
 const EMPTY_HIGHLIGHTS: PdfHighlight[] = []
+const EMPTY_HIGHLIGHT_IDS = new Set<string>()
 const KEYBOARD_SHORTCUTS = [
   ['Ctrl + O', 'Open PDF'],
   ['Ctrl + P', 'Print PDF'],
   ['Ctrl + F', 'Search'],
+  ['Ctrl + Shift + F', 'Search all PDFs'],
   ['Ctrl + H', 'Highlight selected text'],
   ['Ctrl + Mouse Wheel', 'Zoom'],
   ['Ctrl + +', 'Zoom In'],
   ['Ctrl + -', 'Zoom Out'],
   ['Ctrl + 0', 'Reset Zoom'],
+  ['Ctrl + Tab', 'Next Tab'],
+  ['Ctrl + Shift + Tab', 'Previous Tab'],
+  ['Ctrl + W', 'Close Tab'],
+  ['Ctrl + Shift + T', 'Restore Closed Tab'],
+  ['Ctrl + 1-9', 'Jump to Tab'],
+  ['Ctrl + \\', 'Toggle Split View'],
+  ['Ctrl + Shift + Left/Right', 'Focus Split Pane'],
   ['PageUp', 'Previous Page'],
   ['PageDown', 'Next Page'],
   ['F11', 'Toggle Fullscreen'],
@@ -145,9 +220,64 @@ const KEYBOARD_SHORTCUTS = [
 ]
 
 function App() {
+  const [referencesOpen, setReferencesOpen] = useState(false)
+  const [mergePdfsOpen, setMergePdfsOpen] = useState(false)
+  const [imagesToPdfOpen, setImagesToPdfOpen] = useState(false)
+  const [signatureManagerOpen, setSignatureManagerOpen] = useState(false)
+  const [referenceStatus, setReferenceStatus] = useState<ReferenceQueryResponse['stats']>({ references: 0, authors: 0, publishers: 0, recent: 0, missingMetadata: 0, filtered: 0 })
+  const [workspaceManagerOpen, setWorkspaceManagerOpen] = useState(false)
+  const [workspaceList, setWorkspaceList] = useState<WorkspaceSummary[]>([])
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState('')
+  const [workspaceDetails, setWorkspaceDetails] = useState<WorkspaceDetails | null>(null)
+  const [workspaceLoading, setWorkspaceLoading] = useState(false)
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null)
+  const [globalDashboardOpen, setGlobalDashboardOpen] = useState(false)
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false)
+  const [globalSearchReturnToDashboard, setGlobalSearchReturnToDashboard] = useState(false)
+  const [globalSearchStatus, setGlobalSearchStatus] = useState<GlobalSearchResponse>(EMPTY_GLOBAL_SEARCH_RESPONSE)
+  const [pendingGlobalSearchNavigation, setPendingGlobalSearchNavigation] = useState<{
+    result: GlobalSearchResult
+    query: string
+  } | null>(null)
+  const [highlightLibrary, setHighlightLibrary] = useState<HighlightLibrary>({
+    entries: [],
+    stats: {
+      totalDocuments: 0,
+      totalHighlights: 0,
+      categories: { important: 0, research: 0, reference: 0, question: 0 },
+    },
+  })
+  const [highlightLibraryLoading, setHighlightLibraryLoading] = useState(false)
+  const [highlightLibraryError, setHighlightLibraryError] = useState<string | null>(null)
+  const [highlightLibraryFilteredCount, setHighlightLibraryFilteredCount] = useState(0)
+  const [searchIndexProgress, setSearchIndexProgress] = useState<{ indexed: number; total: number } | null>(null)
+  const [pendingLibraryNavigation, setPendingLibraryNavigation] =
+    useState<HighlightLibraryEntry | null>(null)
   const [pdfFile, setPdfFile] = useState<PdfFile | null>(null)
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null)
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>([])
+  const [tabs, setTabs] = useState<PdfTab[]>([])
+  const [activeTabId, setActiveTabId] = useState<string | null>(null)
+  const [closedTabs, setClosedTabs] = useState<PdfTab[]>([])
+  const [tabContextMenu, setTabContextMenu] = useState<{
+    tabId: string
+    x: number
+    y: number
+  } | null>(null)
+  const [draggedTabId, setDraggedTabId] = useState<string | null>(null)
+  const [tabDropTargetId, setTabDropTargetId] = useState<string | null>(null)
+  const [splitEnabled, setSplitEnabled] = useState(false)
+  const [splitRatio, setSplitRatio] = useState(0.5)
+  const [activePane, setActivePane] = useState<PaneSide>('left')
+  const [leftPane, setLeftPane] = useState<PaneAssignment>(() => emptyPane('left'))
+  const [rightPane, setRightPane] = useState<PaneAssignment>(() => emptyPane('right'))
+  const [rightDocument, setRightDocument] = useState<SplitPaneDocument | null>(null)
+  const [splitMenuOpen, setSplitMenuOpen] = useState(false)
+  const [splitResizing, setSplitResizing] = useState(false)
+  const syncScrolling = false
+  const [searchBothPanes, setSearchBothPanes] = useState(false)
+  const [rightSearchStatus, setRightSearchStatus] = useState({ current: 0, total: 0, query: '' })
+  const [rightViewStatus, setRightViewStatus] = useState({ page: 1, totalPages: 0, zoom: 1, fitMode: false })
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null)
   const [numPages, setNumPages] = useState(0)
   const [displayZoom, setDisplayZoom] = useState(1)
@@ -184,6 +314,18 @@ function App() {
   const [documentMetadata, setDocumentMetadata] = useState<DocumentMetadata | null>(null)
   const [metadataLoading, setMetadataLoading] = useState(false)
   const [highlights, setHighlights] = useState<PdfHighlight[]>([])
+  const [signaturePlacements, setSignaturePlacements] = useState<SignaturePlacement[]>([])
+  const [fillSignFields, setFillSignFields] = useState<FillSignField[]>([])
+  const [activeFillSignTool, setActiveFillSignTool] = useState<FillSignTool | null>(null)
+  const [selectedFillSignFieldId, setSelectedFillSignFieldId] = useState<string | null>(null)
+  const [fillSignDateFormat, setFillSignDateFormat] =
+    useState<FillSignDateFormat>('DD/MM/YYYY')
+  const [fillSignDateMenuOpen, setFillSignDateMenuOpen] = useState(false)
+  const [savedSignatures, setSavedSignatures] = useState<SavedSignature[]>([])
+  const [signPickerOpen, setSignPickerOpen] = useState(false)
+  const [signaturesLoading, setSignaturesLoading] = useState(false)
+  const [signingSignature, setSigningSignature] = useState<SavedSignature | null>(null)
+  const [selectedSignaturePlacementId, setSelectedSignaturePlacementId] = useState<string | null>(null)
   const [pendingHighlightSelection, setPendingHighlightSelection] =
     useState<PendingHighlightSelection | null>(null)
   const [highlightContextMenu, setHighlightContextMenu] = useState<{
@@ -193,7 +335,8 @@ function App() {
   } | null>(null)
   const [focusedHighlightId, setFocusedHighlightId] = useState<string | null>(null)
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null)
-  const [selectedHighlightIds, setSelectedHighlightIds] = useState<Set<string>>(() => new Set())
+  const [selectedHighlightIdsByDocument, setSelectedHighlightIdsByDocument] =
+    useState<Map<string, Set<string>>>(() => new Map())
   const [exportHighlightsOpen, setExportHighlightsOpen] = useState(false)
   const [exportFormat, setExportFormat] = useState<'markdown' | 'text' | 'docx'>('markdown')
   const [exportScope, setExportScope] = useState<'all' | 'category' | 'selected'>('all')
@@ -205,9 +348,12 @@ function App() {
   const [rotation, setRotation] = useState(0)
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false)
   const [dragActive, setDragActive] = useState(false)
+  const [dropTargetPane, setDropTargetPane] = useState<PaneSide | null>(null)
   const [isPrinting, setIsPrinting] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+  const [isSavingSignedCopy, setIsSavingSignedCopy] = useState(false)
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
+  const [pdfToolsMenuOpen, setPdfToolsMenuOpen] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [viewMode, setViewMode] = useState<ViewMode>('continuous')
   const [viewerBackground, setViewerBackground] = useState<ViewerBackground>('dark-gray')
@@ -225,8 +371,12 @@ function App() {
   const zoomSnapshotTimeoutRef = useRef(0)
   const isRestoringZoomPositionRef = useRef(false)
   const pendingRestorePageRef = useRef<number | null>(null)
+  const pendingRestoreOffsetRef = useRef(0)
   const restoringReadingStateRef = useRef(false)
   const recentFilesRef = useRef<HTMLDetailsElement>(null)
+  const pdfToolsMenuRef = useRef<HTMLDivElement>(null)
+  const fillSignDateMenuRef = useRef<HTMLDivElement>(null)
+  const signPickerRef = useRef<HTMLDivElement>(null)
   const displayZoomRef = useRef(1)
   const renderZoomRef = useRef(1)
   const wheelDeltaRef = useRef(0)
@@ -250,9 +400,77 @@ function App() {
   const documentLoadStartedRef = useRef(0)
   const initialPageRenderedRef = useRef(false)
   const backgroundDocumentTaskRef = useRef(0)
+  const searchIndexAbortRef = useRef<AbortController | null>(null)
   const highlightSaveGenerationRef = useRef(0)
+  const signaturePlacementSaveGenerationRef = useRef(0)
+  const signaturePlacementSaveTimeoutRef = useRef(0)
+  const fillSignSaveGenerationRef = useRef(0)
+  const fillSignSaveTimeoutRef = useRef(0)
   const highlightFocusTimeoutRef = useRef(0)
   const highlightPageMapRef = useRef(new Map<number, PdfHighlight[]>())
+  const tabsRef = useRef<PdfTab[]>([])
+  const activeTabIdRef = useRef<string | null>(null)
+  const closedTabsRef = useRef<PdfTab[]>([])
+  const workspaceReadyRef = useRef(false)
+  const workspaceSaveTimeoutRef = useRef(0)
+  const workspaceSwitchingRef = useRef(false)
+  const documentLoadPromisesRef = useRef(new Map<string, Promise<OpenedPdf>>())
+  const openWorkspaceDocumentRef = useRef<(
+    documentId: string,
+    options?: WorkspaceNavigationOptions,
+  ) => Promise<void>>(async () => undefined)
+  const tabSwitchGenerationRef = useRef(0)
+  const pendingSearchMatchIndexRef = useRef(-1)
+  const draggedTabIdRef = useRef<string | null>(null)
+  const splitContainerRef = useRef<HTMLDivElement>(null)
+  const leftPaneContainerRef = useRef<HTMLDivElement>(null)
+  const rightPaneRef = useRef<SplitDocumentPaneHandle>(null)
+  const syncScrollTokenRef = useRef(0)
+  const lastLeftScrollPositionRef = useRef({ page: 1, offset: 0 })
+  const rightPaneLoadGenerationRef = useRef(0)
+  const rightSidebarHighlightSaveGenerationRef = useRef(0)
+  const suppressLeftSyncRef = useRef(false)
+  const leftPaneAssignmentRef = useRef(leftPane)
+  const rightPaneAssignmentRef = useRef(rightPane)
+
+  const leftTabId = leftPane.tabId
+  const rightTabId = rightPane.tabId
+  const rightPaneState = rightPane.state ? toSplitPaneState(rightPane.state) : null
+  leftPaneAssignmentRef.current = leftPane
+  rightPaneAssignmentRef.current = rightPane
+  openWorkspaceDocumentRef.current = openWorkspaceDocument
+
+  tabsRef.current = tabs
+  activeTabIdRef.current = activeTabId
+  closedTabsRef.current = closedTabs
+
+  const sidebarContext = getSidebarDocumentContext({
+    splitEnabled,
+    activePane,
+    leftDocument: pdfFile,
+    leftHighlights: highlights,
+    leftPane,
+    rightPane,
+    rightDocument,
+  })
+  const sidebarPaneId = sidebarContext.paneId
+  const sidebarDocument = sidebarContext.document
+  const sidebarDocumentId = sidebarContext.documentId
+  const sidebarHighlights = sidebarContext.highlights
+  const selectedHighlightIds = sidebarDocumentId
+    ? selectedHighlightIdsByDocument.get(sidebarDocumentId) ?? EMPTY_HIGHLIGHT_IDS
+    : EMPTY_HIGHLIGHT_IDS
+  const activeSignatureDocument = splitEnabled && activePane === 'right' ? rightDocument : pdfFile
+  const activeSignaturePlacements = splitEnabled && activePane === 'right'
+    ? rightDocument?.signaturePlacements ?? []
+    : signaturePlacements
+  const activeFillSignFields = splitEnabled && activePane === 'right'
+    ? rightDocument?.fillSignFields ?? []
+    : fillSignFields
+  const defaultInitials = useMemo(
+    () => initialsFromSignatures(savedSignatures),
+    [savedSignatures],
+  )
 
   const fitWidthZoom = clampScale(
     viewerWidth > 0 && firstPageWidth > 0 ? viewerWidth / firstPageWidth : displayZoom,
@@ -292,6 +510,24 @@ function App() {
     highlightPageMapRef.current = groupedHighlights
     return groupedHighlights
   }, [highlights])
+  const signaturePlacementsByPage = useMemo(() => {
+    const groupedPlacements = new Map<number, SignaturePlacement[]>()
+    for (const placement of signaturePlacements) {
+      const pagePlacements = groupedPlacements.get(placement.pageNumber) ?? []
+      pagePlacements.push(placement)
+      groupedPlacements.set(placement.pageNumber, pagePlacements)
+    }
+    return groupedPlacements
+  }, [signaturePlacements])
+  const fillSignFieldsByPage = useMemo(() => {
+    const groupedFields = new Map<number, FillSignField[]>()
+    for (const field of fillSignFields) {
+      const pageFields = groupedFields.get(field.pageNumber) ?? []
+      pageFields.push(field)
+      groupedFields.set(field.pageNumber, pageFields)
+    }
+    return groupedFields
+  }, [fillSignFields])
 
   const renderSearchText = useCallback(
     ({ pageNumber, itemIndex, str }: { pageNumber: number; itemIndex: number; str: string }) => {
@@ -341,9 +577,20 @@ function App() {
       return
     }
 
-    loadOpenedPdf(message.pdf)
+    openResultInTab(message.pdf)
     void refreshRecentFiles()
   })
+  const restoreWorkspaceEvent = useEffectEvent(restoreWorkspace)
+  const getCurrentTabStateEvent = useEffectEvent(getCurrentTabState)
+  const navigateToHighlightEvent = useEffectEvent(navigateToHighlight)
+  const goToPageEvent = useEffectEvent(goToPage)
+
+  const handleLibraryFilteredCountChange = useCallback((count: number) => {
+    setHighlightLibraryFilteredCount(count)
+  }, [])
+  const handleGlobalSearchStatusChange = useCallback((response: GlobalSearchResponse) => {
+    setGlobalSearchStatus(response)
+  }, [])
 
   useEffect(() => {
     if (zoomMode !== 'fit-width' || Math.abs(fitWidthZoom - displayZoom) < 0.001) {
@@ -403,10 +650,6 @@ function App() {
   useEffect(() => {
     void refreshRecentFiles()
     void window.electronAPI
-      .getSidebarTab()
-      .then(setSidebarTab)
-      .catch((error) => setErrorMessage(getErrorMessage(error)))
-    void window.electronAPI
       .getViewMode()
       .then(setViewMode)
       .catch((error) => setErrorMessage(getErrorMessage(error)))
@@ -414,27 +657,143 @@ function App() {
       .getViewerBackground()
       .then(setViewerBackground)
       .catch((error) => setErrorMessage(getErrorMessage(error)))
-    void window.electronAPI
-      .getSidebarLayout()
-      .then(({ width, collapsed }) => {
-        setSidebarWidth(width)
-        setThumbnailSidebarOpen(!collapsed)
-      })
-      .catch((error) => setErrorMessage(getErrorMessage(error)))
   }, [])
+
+  useEffect(() => {
+    if (!pendingLibraryNavigation || pdfFile?.id !== pendingLibraryNavigation.documentId || numPages === 0) {
+      return
+    }
+    const highlight = highlights.find(
+      (candidate) => candidate.id === pendingLibraryNavigation.highlightId,
+    )
+    if (!highlight) return
+    const timeout = window.setTimeout(() => {
+      navigateToHighlightEvent(highlight)
+      setPendingLibraryNavigation(null)
+    }, 0)
+    return () => window.clearTimeout(timeout)
+  }, [highlights, numPages, pdfFile, pendingLibraryNavigation])
+
+  useEffect(() => {
+    const navigation = pendingGlobalSearchNavigation
+    if (!navigation || pdfFile?.id !== navigation.result.documentId || numPages === 0) return
+    const timeout = window.setTimeout(() => {
+      const { result, query } = navigation
+      if (result.highlightId) {
+        const highlight = highlights.find((candidate) => candidate.id === result.highlightId)
+        if (!highlight) return
+        navigateToHighlightEvent(highlight)
+        setPendingGlobalSearchNavigation(null)
+        return
+      }
+
+      goToPageEvent(result.pageNumber, 'auto')
+      if (result.type !== 'pdf-text' || !query) {
+        setPendingGlobalSearchNavigation(null)
+        return
+      }
+      if (!searchOpen || searchQuery !== query) {
+        setSearchOpen(true)
+        setSearchQuery(query)
+        setIsSearching(true)
+        return
+      }
+      const matchIndex = searchMatches.findIndex((match) => match.pageNumber === result.pageNumber)
+      if (matchIndex >= 0) {
+        setSelectedMatchIndex(matchIndex)
+        setPendingGlobalSearchNavigation(null)
+      } else if (!isSearching && searchProgress === null) {
+        setPendingGlobalSearchNavigation(null)
+      }
+    }, 0)
+    return () => window.clearTimeout(timeout)
+  }, [highlights, isSearching, numPages, pdfFile, pendingGlobalSearchNavigation, searchMatches, searchOpen, searchProgress, searchQuery])
 
   useEffect(() => {
     const removeSystemOpenListener = window.electronAPI.onOpenPdfFromSystem(
       handleSystemPdfOpen,
     )
 
-    window.electronAPI.notifyRendererReady()
+    void restoreWorkspaceEvent().finally(() => window.electronAPI.notifyRendererReady())
     return removeSystemOpenListener
   }, [])
 
   useEffect(() => {
-    document.title = pdfFile ? `${pdfFile.name} — Next PDF Viewer` : 'Next PDF Viewer'
-  }, [pdfFile])
+    const leftPaneTabId = leftPaneAssignmentRef.current.tabId
+    if (!workspaceReadyRef.current || !leftPaneTabId || !pdfFile) {
+      return
+    }
+
+    const timeout = window.setTimeout(() => {
+      const state = getCurrentTabStateEvent()
+      updatePaneAssignmentState('left', state)
+      updateTabCollections(
+        tabsRef.current.map((tab) =>
+          tab.tabId === leftPaneTabId ? { ...tab, state } : tab,
+        ),
+        closedTabsRef.current,
+      )
+    }, 160)
+
+    return () => window.clearTimeout(timeout)
+  }, [
+    leftPane.tabId,
+    currentPage,
+    displayZoom,
+    pdfFile,
+    rotation,
+    searchOpen,
+    searchQuery,
+    selectedMatchIndex,
+    sidebarTab,
+    sidebarWidth,
+    thumbnailSidebarOpen,
+    zoomMode,
+  ])
+
+  useEffect(() => {
+    if (!workspaceReadyRef.current || workspaceSwitchingRef.current) {
+      return
+    }
+
+    window.clearTimeout(workspaceSaveTimeoutRef.current)
+    workspaceSaveTimeoutRef.current = window.setTimeout(() => {
+      void window.electronAPI
+        .saveWorkspace({
+          tabs,
+          activeTabId,
+          closedTabs,
+          split: {
+            enabled: splitEnabled,
+            dividerRatio: splitRatio,
+            activePane,
+            leftPane,
+            rightPane,
+            syncScrolling,
+          },
+        })
+        .catch((error) => setErrorMessage(`Workspace save failed: ${getErrorMessage(error)}`))
+    }, 250)
+
+    return () => window.clearTimeout(workspaceSaveTimeoutRef.current)
+  }, [
+    activePane,
+    activeTabId,
+    closedTabs,
+    leftPane,
+    rightPane,
+    splitEnabled,
+    splitRatio,
+    syncScrolling,
+    tabs,
+  ])
+
+  useEffect(() => {
+    const activeFileName = splitEnabled && activePane === 'right'
+      ? rightDocument?.name
+      : pdfFile?.name
+    document.title = activeFileName ? `${activeFileName} — Next PDF Viewer` : 'Next PDF Viewer'
+  }, [activePane, pdfFile, rightDocument, splitEnabled])
 
   useEffect(() => {
     void window.electronAPI
@@ -446,44 +805,145 @@ function App() {
   }, [])
 
   useEffect(() => {
+    function closePdfToolsOnOutsideInteraction(event: PointerEvent | FocusEvent) {
+      const target = event.target as Node | null
+      if (target && pdfToolsMenuRef.current?.contains(target)) {
+        return
+      }
+      setPdfToolsMenuOpen(false)
+    }
+
+    document.addEventListener('pointerdown', closePdfToolsOnOutsideInteraction, true)
+    document.addEventListener('focusin', closePdfToolsOnOutsideInteraction, true)
+    return () => {
+      document.removeEventListener('pointerdown', closePdfToolsOnOutsideInteraction, true)
+      document.removeEventListener('focusin', closePdfToolsOnOutsideInteraction, true)
+    }
+  }, [])
+
+  useEffect(() => {
+    function closeSignPickerOnOutsideInteraction(event: PointerEvent | FocusEvent) {
+      const target = event.target as Node | null
+      if (target && signPickerRef.current?.contains(target)) {
+        return
+      }
+      setSignPickerOpen(false)
+    }
+
+    document.addEventListener('pointerdown', closeSignPickerOnOutsideInteraction, true)
+    document.addEventListener('focusin', closeSignPickerOnOutsideInteraction, true)
+    return () => {
+      document.removeEventListener('pointerdown', closeSignPickerOnOutsideInteraction, true)
+      document.removeEventListener('focusin', closeSignPickerOnOutsideInteraction, true)
+    }
+  }, [])
+
+  useEffect(() => {
+    function closeFillSignDateMenuOnOutsideInteraction(event: PointerEvent | FocusEvent) {
+      const target = event.target as Node | null
+      if (target && fillSignDateMenuRef.current?.contains(target)) {
+        return
+      }
+      setFillSignDateMenuOpen(false)
+    }
+
+    document.addEventListener('pointerdown', closeFillSignDateMenuOnOutsideInteraction, true)
+    document.addEventListener('focusin', closeFillSignDateMenuOnOutsideInteraction, true)
+    return () => {
+      document.removeEventListener('pointerdown', closeFillSignDateMenuOnOutsideInteraction, true)
+      document.removeEventListener('focusin', closeFillSignDateMenuOnOutsideInteraction, true)
+    }
+  }, [])
+
+  useEffect(() => {
+    function deselectSignatureOnOutsidePointer(event: PointerEvent) {
+      if (!selectedSignaturePlacementId && !selectedFillSignFieldId) return
+      const target = event.target instanceof Element ? event.target : null
+      if (
+        target?.closest('[data-signature-placement-id]') ||
+        target?.closest('[data-signature-toolbar]') ||
+        target?.closest('[data-signature-picker]') ||
+        target?.closest('[data-fill-sign-field-id]') ||
+        target?.closest('[data-fill-sign-toolbar]') ||
+        target?.closest('[data-fill-sign-tools]')
+      ) {
+        return
+      }
+      setSelectedSignaturePlacementId(null)
+      setSelectedFillSignFieldId(null)
+    }
+
+    document.addEventListener('pointerdown', deselectSignatureOnOutsidePointer, true)
+    return () => document.removeEventListener('pointerdown', deselectSignatureOnOutsidePointer, true)
+  }, [selectedFillSignFieldId, selectedSignaturePlacementId])
+
+  useEffect(() => {
+    void refreshSavedSignatures()
+  }, [])
+
+  useEffect(() => {
+    function isInternalDrag(event: DragEvent) {
+      return Array.from(event.dataTransfer?.types ?? []).includes('application/x-nextpdf-signature')
+    }
+
     function hasFiles(event: DragEvent) {
       return Array.from(event.dataTransfer?.types ?? []).includes('Files')
     }
 
     function handleDragEnter(event: DragEvent) {
-      event.preventDefault()
-      if (!hasFiles(event)) {
+      if (isInternalDrag(event) || !hasFiles(event)) {
         return
       }
 
+      event.preventDefault()
       dragDepthRef.current += 1
       setDragActive(true)
+      const pane = (event.target as Element | null)?.closest<HTMLElement>('[data-pane]')?.dataset.pane
+      setDropTargetPane(pane === 'left' || pane === 'right' ? pane : null)
     }
 
     function handleDragOver(event: DragEvent) {
+      if (isInternalDrag(event) || !hasFiles(event)) {
+        return
+      }
+
       event.preventDefault()
       if (event.dataTransfer) {
         event.dataTransfer.dropEffect = 'copy'
       }
+      const pane = (event.target as Element | null)?.closest<HTMLElement>('[data-pane]')?.dataset.pane
+      setDropTargetPane(pane === 'left' || pane === 'right' ? pane : null)
     }
 
     function handleDragLeave(event: DragEvent) {
+      if (isInternalDrag(event) || !hasFiles(event)) {
+        return
+      }
+
       event.preventDefault()
       dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
       if (dragDepthRef.current === 0) {
         setDragActive(false)
+        setDropTargetPane(null)
       }
     }
 
     function handleDrop(event: DragEvent) {
-      event.preventDefault()
-      dragDepthRef.current = 0
-      setDragActive(false)
+      if (isInternalDrag(event)) {
+        return
+      }
 
       const files = Array.from(event.dataTransfer?.files ?? [])
       if (files.length === 0) {
         return
       }
+
+      event.preventDefault()
+      dragDepthRef.current = 0
+      setDragActive(false)
+      const pane = (event.target as Element | null)?.closest<HTMLElement>('[data-pane]')?.dataset.pane
+      const targetPane = pane === 'left' || pane === 'right' ? pane : activePane
+      setDropTargetPane(null)
 
       const firstPdf = files.find((file) => file.name.toLowerCase().endsWith('.pdf'))
       if (!firstPdf) {
@@ -491,7 +951,7 @@ function App() {
         return
       }
 
-      void openDroppedPdf(firstPdf)
+      void openDroppedPdf(firstPdf, targetPane)
     }
 
     window.addEventListener('dragenter', handleDragEnter)
@@ -512,7 +972,9 @@ function App() {
       window.clearTimeout(zoomDebounceRef.current)
       window.clearTimeout(zoomSnapshotTimeoutRef.current)
       window.clearTimeout(backgroundDocumentTaskRef.current)
+      searchIndexAbortRef.current?.abort()
       window.clearTimeout(highlightFocusTimeoutRef.current)
+      window.clearTimeout(workspaceSaveTimeoutRef.current)
       window.cancelAnimationFrame(pageScrollFrameRef.current)
       window.cancelAnimationFrame(wheelZoomFrameRef.current)
     },
@@ -707,7 +1169,12 @@ function App() {
               `Text extraction/search time: ${formatDuration(performance.now() - searchStarted)} (${pdfDocument.numPages} pages)`,
             )
             setSearchMatches(matches)
-            setSelectedMatchIndex(matches.length > 0 ? 0 : -1)
+            const restoredMatchIndex = Math.min(
+              matches.length - 1,
+              Math.max(0, pendingSearchMatchIndexRef.current),
+            )
+            setSelectedMatchIndex(matches.length > 0 ? restoredMatchIndex : -1)
+            pendingSearchMatchIndexRef.current = -1
             if (matches.length > 0 && viewModeRef.current === 'single') {
               const firstMatchPage = matches[0].pageNumber
               currentPageRef.current = firstMatchPage
@@ -867,8 +1334,15 @@ function App() {
 
     function scrollToRestoredPage() {
       const headerHeight = headerRef.current?.offsetHeight ?? 0
+      const pageOffset = pendingRestoreOffsetRef.current
+      const restoredBounds = restoredPage.getBoundingClientRect()
+      const targetTop =
+        window.scrollY +
+        restoredBounds.top -
+        headerHeight +
+        (pageOffset > 0 ? restoredBounds.height * pageOffset : -16)
       window.scrollTo({
-        top: window.scrollY + restoredPage.getBoundingClientRect().top - headerHeight - 16,
+        top: targetTop,
         behavior: 'auto',
       })
       currentPageRef.current = pageNumber
@@ -916,6 +1390,7 @@ function App() {
           setCurrentPage(pageNumber)
           setPageInput(String(pageNumber))
           pendingRestorePageRef.current = null
+          pendingRestoreOffsetRef.current = 0
           restoringReadingStateRef.current = false
           finished = true
           setIsRestoring(false)
@@ -1078,11 +1553,51 @@ function App() {
   }, [isRestoring, numPages, observedSinglePage, viewMode])
 
   useEffect(() => {
+    if (!splitEnabled || !syncScrolling || !rightDocument) {
+      return
+    }
+    let frame = 0
+    function syncRightPane() {
+      frame = 0
+      if (suppressLeftSyncRef.current) {
+        return
+      }
+      const pageNumber = currentPageRef.current
+      const page = pageRefs.current.get(pageNumber)
+      if (!page) {
+        return
+      }
+      const bounds = page.getBoundingClientRect()
+      const viewportTop = headerRef.current?.offsetHeight ?? 0
+      const offset = Math.min(1, Math.max(0, (viewportTop - bounds.top) / bounds.height))
+      const previous = lastLeftScrollPositionRef.current
+      if (previous.page === pageNumber && Math.abs(previous.offset - offset) < 0.005) {
+        return
+      }
+      lastLeftScrollPositionRef.current = { page: pageNumber, offset }
+      rightPaneRef.current?.applyScrollPosition({
+        page: pageNumber,
+        offset,
+        token: ++syncScrollTokenRef.current,
+      })
+    }
+    function scheduleSync() {
+      if (!frame) frame = window.requestAnimationFrame(syncRightPane)
+    }
+    window.addEventListener('scroll', scheduleSync, { passive: true })
+    return () => {
+      window.removeEventListener('scroll', scheduleSync)
+      window.cancelAnimationFrame(frame)
+    }
+  }, [rightDocument, splitEnabled, syncScrolling])
+
+  useEffect(() => {
     function handleSelectionPointerUp(event: PointerEvent) {
       const target = event.target instanceof Element ? event.target : null
       if (
         event.button !== 0 ||
         !pdfFile ||
+        !target?.closest('[data-pane="left"]') ||
         !target?.closest('.react-pdf__Page__textContent') ||
         target.closest('[data-highlight-toolbar]')
       ) {
@@ -1105,6 +1620,7 @@ function App() {
         return
       }
 
+      setTabContextMenu(null)
       setHighlightContextMenu(null)
       if (!target?.closest('.react-pdf__Page__textContent')) {
         setPendingHighlightSelection(null)
@@ -1129,6 +1645,9 @@ function App() {
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null
+      const activePaneHasDocument = splitEnabled && activePane === 'right'
+        ? Boolean(rightDocument)
+        : numPages > 0
 
       if (event.key === 'F11') {
         event.preventDefault()
@@ -1144,6 +1663,132 @@ function App() {
         return
       }
 
+      if (event.key === 'Escape' && tabContextMenu) {
+        event.preventDefault()
+        setTabContextMenu(null)
+        return
+      }
+
+      if (event.key === 'Escape' && splitMenuOpen) {
+        event.preventDefault()
+        setSplitMenuOpen(false)
+        return
+      }
+
+      if (event.key === 'Escape' && pdfToolsMenuOpen) {
+        event.preventDefault()
+        setPdfToolsMenuOpen(false)
+        return
+      }
+
+      if (event.key === 'Escape' && (signPickerOpen || signingSignature)) {
+        event.preventDefault()
+        setSignPickerOpen(false)
+        setSigningSignature(null)
+        setSelectedSignaturePlacementId(null)
+        return
+      }
+
+      if (event.key === 'Escape' && selectedSignaturePlacementId) {
+        event.preventDefault()
+        setSelectedSignaturePlacementId(null)
+        return
+      }
+
+      if (event.key === 'Escape' && (activeFillSignTool || selectedFillSignFieldId)) {
+        event.preventDefault()
+        setActiveFillSignTool(null)
+        setSelectedFillSignFieldId(null)
+        return
+      }
+
+      if (selectedFillSignFieldId && activePane !== 'right') {
+        if (isEditableKeyboardTarget(target)) {
+          return
+        }
+        if (event.key === 'Delete' || event.key === 'Backspace') {
+          event.preventDefault()
+          deleteLeftFillSignField(selectedFillSignFieldId)
+          return
+        }
+        if (event.ctrlKey && !event.shiftKey && event.key.toLowerCase() === 'd') {
+          event.preventDefault()
+          duplicateLeftFillSignField(selectedFillSignFieldId)
+          return
+        }
+      }
+
+      if (selectedSignaturePlacementId && activePane !== 'right') {
+        if (event.key === 'Delete' || event.key === 'Backspace') {
+          event.preventDefault()
+          deleteLeftSignaturePlacement(selectedSignaturePlacementId)
+          return
+        }
+        if (event.ctrlKey && !event.shiftKey && event.key.toLowerCase() === 'd') {
+          event.preventDefault()
+          duplicateLeftSignaturePlacement(selectedSignaturePlacementId)
+          return
+        }
+      }
+
+      if (event.key === 'Escape' && globalSearchOpen) {
+        event.preventDefault()
+        closeGlobalSearch()
+        return
+      }
+
+      if (event.ctrlKey && event.key === 'Tab') {
+        event.preventDefault()
+        cycleTabs(event.shiftKey ? -1 : 1)
+        return
+      }
+
+      if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 't') {
+        event.preventDefault()
+        void restoreClosedTab()
+        return
+      }
+
+      if (event.ctrlKey && !event.shiftKey && event.key.toLowerCase() === 'w') {
+        event.preventDefault()
+        const tabId = splitEnabled && activePane === 'right' ? rightTabId : activeTabIdRef.current
+        if (tabId) {
+          void closeTab(tabId)
+        }
+        return
+      }
+
+      if (event.ctrlKey && !event.shiftKey && (event.key === '\\' || event.code === 'Backslash')) {
+        event.preventDefault()
+        if (splitEnabled) closeSplitView()
+        else void splitCurrentTab()
+        return
+      }
+
+      if (event.ctrlKey && event.shiftKey && event.key === 'ArrowLeft') {
+        event.preventDefault()
+        focusPane('left')
+        viewerRef.current?.focus()
+        return
+      }
+
+      if (event.ctrlKey && event.shiftKey && event.key === 'ArrowRight' && splitEnabled) {
+        event.preventDefault()
+        focusPane('right')
+        rightPaneRef.current?.focus()
+        return
+      }
+
+      if (event.ctrlKey && !event.shiftKey && /^[1-9]$/.test(event.key)) {
+        const tabIndex = Number(event.key) - 1
+        const tab = tabsRef.current[tabIndex]
+        if (tab) {
+          event.preventDefault()
+          activateTabForPane(tab.tabId)
+        }
+        return
+      }
+
       if (event.ctrlKey && event.key.toLowerCase() === 'o') {
         event.preventDefault()
         void openPdf()
@@ -1152,22 +1797,32 @@ function App() {
 
       if (event.ctrlKey && event.key.toLowerCase() === 'p') {
         event.preventDefault()
-        if (activeDocumentId) {
+        if (splitEnabled && activePane === 'right' ? rightDocument : activeDocumentId) {
           void printCurrentPdf()
         }
         return
       }
 
-      if (event.ctrlKey && event.key.toLowerCase() === 'f') {
+      if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'f') {
         event.preventDefault()
-        if (pdfDocument) {
-          setSearchOpen(true)
-        }
+        setGlobalDashboardOpen(false)
+        setGlobalSearchReturnToDashboard(false)
+        setGlobalSearchOpen(true)
+        return
+      }
+
+      if (event.ctrlKey && !event.shiftKey && event.key.toLowerCase() === 'f') {
+        event.preventDefault()
+        openActivePaneSearch()
         return
       }
 
       if (event.ctrlKey && event.key.toLowerCase() === 'h') {
         event.preventDefault()
+        if (splitEnabled && activePane === 'right') {
+          rightPaneRef.current?.highlightSelection('yellow')
+          return
+        }
         const selection = pendingHighlightSelection ?? readPdfTextSelection()
         if (selection) {
           addHighlight(selection, 'yellow')
@@ -1190,22 +1845,22 @@ function App() {
         return
       }
 
-      if (event.ctrlKey && numPages > 0) {
+      if (event.ctrlKey && activePaneHasDocument) {
         if (event.key === '+' || event.key === '=' || event.code === 'NumpadAdd') {
           event.preventDefault()
-          changeZoom(displayZoomRef.current + 0.25)
+          changeActiveZoom(0.25)
           return
         }
 
         if (event.key === '-' || event.code === 'NumpadSubtract') {
           event.preventDefault()
-          changeZoom(displayZoomRef.current - 0.25)
+          changeActiveZoom(-0.25)
           return
         }
 
         if (event.key === '0' || event.code === 'Numpad0') {
           event.preventDefault()
-          changeZoom(1)
+          changeActiveZoom('reset')
           return
         }
       }
@@ -1213,22 +1868,22 @@ function App() {
       if (
         target?.matches('input, textarea, select') ||
         target?.isContentEditable ||
-        numPages === 0
+        !activePaneHasDocument
       ) {
         return
       }
 
-      const destinations: Partial<Record<KeyboardEvent['key'], number>> = {
-        PageDown: currentPageRef.current + 1,
-        PageUp: currentPageRef.current - 1,
-        Home: 1,
-        End: numPages,
+      const navigationActions: Partial<Record<KeyboardEvent['key'], 'next' | 'previous' | 'first' | 'last'>> = {
+        PageDown: 'next',
+        PageUp: 'previous',
+        Home: 'first',
+        End: 'last',
       }
-      const destination = destinations[event.key]
+      const navigationAction = navigationActions[event.key]
 
-      if (destination !== undefined) {
+      if (navigationAction) {
         event.preventDefault()
-        goToPage(destination)
+        goToActivePage(navigationAction)
       }
     }
 
@@ -1238,7 +1893,10 @@ function App() {
 
   useEffect(() => {
     function handleWheel(event: WheelEvent) {
-      if (!event.ctrlKey || numPages === 0) {
+      const activePaneHasDocument = splitEnabled && activePane === 'right'
+        ? Boolean(rightDocument)
+        : numPages > 0
+      if (!event.ctrlKey || !activePaneHasDocument) {
         wheelDeltaRef.current = 0
         return
       }
@@ -1272,7 +1930,11 @@ function App() {
         wheelZoomFrameRef.current = 0
         const zoomStep = wheelDeltaRef.current < 0 ? 0.1 : -0.1
         wheelDeltaRef.current = 0
-        changeZoom(displayZoomRef.current + zoomStep)
+        if (splitEnabled && activePane === 'right') {
+          rightPaneRef.current?.zoomBy(zoomStep)
+        } else {
+          changeZoom(displayZoomRef.current + zoomStep)
+        }
       })
     }
 
@@ -1557,7 +2219,9 @@ function App() {
     const range = selection.getRangeAt(0)
     const startPage = getPdfPageElement(range.startContainer)
     const endPage = getPdfPageElement(range.endContainer)
-    if (!startPage || startPage !== endPage) {
+    const selectionBelongsToLeftPane = Boolean(startPage?.closest('[data-pane="left"]'))
+    if (!startPage || startPage !== endPage || !selectionBelongsToLeftPane) {
+      if (!selectionBelongsToLeftPane) return null
       setErrorMessage('Highlights must be created within a single PDF page.')
       return null
     }
@@ -1694,12 +2358,12 @@ function App() {
   }
 
   function removeHighlight(highlightId: string) {
-    if (!highlights.some((highlight) => highlight.id === highlightId)) {
+    if (!sidebarHighlights.some((highlight) => highlight.id === highlightId)) {
       return
     }
 
-    updateHighlights(highlights.filter((highlight) => highlight.id !== highlightId))
-    setSelectedHighlightIds((current) => {
+    updateSidebarHighlights(sidebarHighlights.filter((highlight) => highlight.id !== highlightId))
+    updateSidebarHighlightSelection((current) => {
       const next = new Set(current)
       next.delete(highlightId)
       return next
@@ -1711,8 +2375,8 @@ function App() {
   }
 
   function changeHighlightColor(highlightId: string, color: HighlightColor) {
-    updateHighlights(
-      highlights.map((highlight) =>
+    updateSidebarHighlights(
+      sidebarHighlights.map((highlight) =>
         highlight.id === highlightId ? { ...highlight, color } : highlight,
       ),
     )
@@ -1720,8 +2384,8 @@ function App() {
   }
 
   function changeHighlightCategory(highlightId: string, category: HighlightCategory) {
-    updateHighlights(
-      highlights.map((highlight) =>
+    updateSidebarHighlights(
+      sidebarHighlights.map((highlight) =>
         highlight.id === highlightId ? { ...highlight, category } : highlight,
       ),
     )
@@ -1729,7 +2393,7 @@ function App() {
   }
 
   async function copyHighlightText(highlightId: string) {
-    const highlight = highlights.find((candidate) => candidate.id === highlightId)
+    const highlight = sidebarHighlights.find((candidate) => candidate.id === highlightId)
     if (!highlight) {
       return
     }
@@ -1743,7 +2407,7 @@ function App() {
   }
 
   async function copyHighlightWithNote(highlightId: string) {
-    const highlight = highlights.find((candidate) => candidate.id === highlightId)
+    const highlight = sidebarHighlights.find((candidate) => candidate.id === highlightId)
     if (!highlight) {
       return
     }
@@ -1772,27 +2436,27 @@ function App() {
 
   function saveHighlightNote(highlightId: string, note: string) {
     const normalizedNote = note.trimEnd()
-    const highlight = highlights.find((candidate) => candidate.id === highlightId)
+    const highlight = sidebarHighlights.find((candidate) => candidate.id === highlightId)
     if (!highlight || highlight.note === normalizedNote) {
       return
     }
-    updateHighlights(
-      highlights.map((candidate) =>
+    updateSidebarHighlights(
+      sidebarHighlights.map((candidate) =>
         candidate.id === highlightId ? { ...candidate, note: normalizedNote } : candidate,
       ),
     )
   }
 
   function toggleHighlightSelected(highlightId: string) {
-    setSelectedHighlightIds((current) => toggleSetValue(current, highlightId))
+    updateSidebarHighlightSelection((current) => toggleSetValue(current, highlightId))
   }
 
   async function exportHighlightCollection() {
-    if (!pdfFile) {
+    if (!sidebarDocument) {
       return
     }
 
-    let candidates = highlights
+    let candidates = sidebarHighlights
     if (exportScope === 'category') {
       candidates = candidates.filter((highlight) => highlight.category === exportCategory)
     } else if (exportScope === 'selected') {
@@ -1807,7 +2471,7 @@ function App() {
     setIsExportingHighlights(true)
     try {
       const exportedPath = await window.electronAPI.exportHighlights({
-        id: pdfFile.id,
+        id: sidebarDocument.id,
         format: exportFormat,
         highlights: candidates,
       })
@@ -1821,6 +2485,48 @@ function App() {
     }
   }
 
+  function updateSidebarHighlightSelection(updater: (current: Set<string>) => Set<string>) {
+    if (!sidebarDocumentId) return
+    setSelectedHighlightIdsByDocument((current) => {
+      const next = new Map(current)
+      next.set(sidebarDocumentId, updater(next.get(sidebarDocumentId) ?? new Set()))
+      return next
+    })
+  }
+
+  function updateSidebarHighlights(nextHighlights: PdfHighlight[]) {
+    if (sidebarPaneId === 'left') {
+      updateHighlights(nextHighlights)
+      return
+    }
+
+    const document = rightDocument
+    if (!document) return
+    const previousHighlights = document.highlights
+    const generation = ++rightSidebarHighlightSaveGenerationRef.current
+    handleSplitHighlightsChange(document.id, nextHighlights)
+    void window.electronAPI
+      .savePdfHighlights(
+        {
+          id: document.id,
+          fileSize: document.fileSize,
+          modifiedAt: document.modifiedAt,
+        },
+        nextHighlights,
+      )
+      .then((savedHighlights) => {
+        if (rightSidebarHighlightSaveGenerationRef.current === generation) {
+          handleSplitHighlightsChange(document.id, savedHighlights)
+        }
+      })
+      .catch((error) => {
+        if (rightSidebarHighlightSaveGenerationRef.current === generation) {
+          handleSplitHighlightsChange(document.id, previousHighlights)
+          setErrorMessage(`Failed to save highlight: ${getErrorMessage(error)}`)
+        }
+      })
+  }
+
   function updateHighlights(nextHighlights: PdfHighlight[]) {
     const document = pdfFile
     if (!document) {
@@ -1830,6 +2536,9 @@ function App() {
     const previousHighlights = highlights
     const generation = ++highlightSaveGenerationRef.current
     setHighlights(nextHighlights)
+    setRightDocument((current) =>
+      current?.id === document.id ? { ...current, highlights: nextHighlights } : current,
+    )
     void window.electronAPI
       .savePdfHighlights(
         {
@@ -1842,14 +2551,254 @@ function App() {
       .then((savedHighlights) => {
         if (highlightSaveGenerationRef.current === generation) {
           setHighlights(savedHighlights)
+          setRightDocument((current) =>
+            current?.id === document.id ? { ...current, highlights: savedHighlights } : current,
+          )
         }
       })
       .catch((error) => {
         if (highlightSaveGenerationRef.current === generation) {
           setHighlights(previousHighlights)
+          setRightDocument((current) =>
+            current?.id === document.id ? { ...current, highlights: previousHighlights } : current,
+          )
           setErrorMessage(`Failed to save highlight: ${getErrorMessage(error)}`)
         }
       })
+  }
+
+  async function refreshSavedSignatures() {
+    setSignaturesLoading(true)
+    try {
+      setSavedSignatures(await window.electronAPI.listSignatures())
+    } catch (error) {
+      setErrorMessage(`Failed to load signatures: ${getErrorMessage(error)}`)
+    } finally {
+      setSignaturesLoading(false)
+    }
+  }
+
+  function updateSignaturePlacementsForDocument(
+    document: (PdfFile & { signaturePlacements?: SignaturePlacement[] }) | SplitPaneDocument | null,
+    nextPlacements: SignaturePlacement[],
+  ) {
+    if (!document) return
+    const previousPlacements =
+      document.id === pdfFile?.id ? signaturePlacements : document.signaturePlacements ?? []
+    const sanitizedPlacements = nextPlacements.map((placement) => ({
+      ...placement,
+      documentId: document.id,
+    }))
+    const generation = ++signaturePlacementSaveGenerationRef.current
+
+    if (document.id === pdfFile?.id) {
+      setSignaturePlacements(sanitizedPlacements)
+    }
+    setRightDocument((current) =>
+      current?.id === document.id
+        ? { ...current, signaturePlacements: sanitizedPlacements }
+        : current,
+    )
+
+    window.clearTimeout(signaturePlacementSaveTimeoutRef.current)
+    signaturePlacementSaveTimeoutRef.current = window.setTimeout(() => {
+      void window.electronAPI
+        .savePdfSignaturePlacements(
+          {
+            id: document.id,
+            fileSize: document.fileSize,
+            modifiedAt: document.modifiedAt,
+          },
+          sanitizedPlacements,
+        )
+        .then((savedPlacements) => {
+          if (signaturePlacementSaveGenerationRef.current !== generation) return
+          if (document.id === pdfFile?.id) {
+            setSignaturePlacements(savedPlacements)
+          }
+          setRightDocument((current) =>
+            current?.id === document.id
+              ? { ...current, signaturePlacements: savedPlacements }
+              : current,
+          )
+        })
+        .catch((error) => {
+          if (signaturePlacementSaveGenerationRef.current !== generation) return
+          if (document.id === pdfFile?.id) {
+            setSignaturePlacements(previousPlacements)
+          }
+          setRightDocument((current) =>
+            current?.id === document.id
+              ? { ...current, signaturePlacements: previousPlacements }
+              : current,
+          )
+          setErrorMessage(`Failed to save signature placement: ${getErrorMessage(error)}`)
+        })
+    }, 180)
+  }
+
+  function updateLeftSignaturePlacements(nextPlacements: SignaturePlacement[]) {
+    updateSignaturePlacementsForDocument(pdfFile, nextPlacements)
+  }
+
+  function updateRightSignaturePlacements(documentId: string, nextPlacements: SignaturePlacement[]) {
+    const document = rightDocument?.id === documentId ? rightDocument : null
+    updateSignaturePlacementsForDocument(document, nextPlacements)
+  }
+
+  function chooseSignatureForPlacement(signature: SavedSignature) {
+    setSigningSignature(signature)
+    setSelectedSignaturePlacementId(null)
+    setSelectedFillSignFieldId(null)
+    setActiveFillSignTool(null)
+    setSignPickerOpen(false)
+    setErrorMessage(null)
+  }
+
+  function activateFillSignTool(tool: FillSignTool) {
+    setActiveFillSignTool((current) => current === tool ? null : tool)
+    setSigningSignature(null)
+    setSignPickerOpen(false)
+    setSelectedSignaturePlacementId(null)
+    setSelectedFillSignFieldId(null)
+    setErrorMessage(null)
+  }
+
+  function addLeftSignaturePlacement(placement: SignaturePlacement) {
+    updateLeftSignaturePlacements([...signaturePlacements, placement])
+    setSelectedSignaturePlacementId(placement.id)
+  }
+
+  function updateLeftSignaturePlacement(placementId: string, patch: Partial<SignaturePlacement>) {
+    updateLeftSignaturePlacements(
+      signaturePlacements.map((placement) =>
+        placement.id === placementId ? { ...placement, ...patch } : placement,
+      ),
+    )
+  }
+
+  function deleteLeftSignaturePlacement(placementId: string) {
+    if (!window.confirm('Delete this placed signature?')) return
+    updateLeftSignaturePlacements(signaturePlacements.filter((placement) => placement.id !== placementId))
+    setSelectedSignaturePlacementId(null)
+  }
+
+  function duplicateLeftSignaturePlacement(placementId: string) {
+    const placement = signaturePlacements.find((candidate) => candidate.id === placementId)
+    if (!placement) return
+    const duplicate = {
+      ...placement,
+      id: window.crypto.randomUUID(),
+      x: Math.min(1 - placement.width, placement.x + 0.03),
+      y: Math.min(1 - placement.height, placement.y + 0.03),
+      xRatio: Math.min(1 - (placement.widthRatio ?? placement.width), (placement.xRatio ?? placement.x) + 0.03),
+      yRatio: Math.min(1 - (placement.heightRatio ?? placement.height), (placement.yRatio ?? placement.y) + 0.03),
+      createdAt: new Date().toISOString(),
+    }
+    updateLeftSignaturePlacements([...signaturePlacements, duplicate])
+    setSelectedSignaturePlacementId(duplicate.id)
+  }
+
+  function bringLeftSignatureForward(placementId: string) {
+    const index = signaturePlacements.findIndex((placement) => placement.id === placementId)
+    if (index < 0 || index === signaturePlacements.length - 1) return
+    const next = [...signaturePlacements]
+    ;[next[index], next[index + 1]] = [next[index + 1], next[index]]
+    updateLeftSignaturePlacements(next)
+  }
+
+  function sendLeftSignatureBackward(placementId: string) {
+    const index = signaturePlacements.findIndex((placement) => placement.id === placementId)
+    if (index <= 0) return
+    const next = [...signaturePlacements]
+    ;[next[index], next[index - 1]] = [next[index - 1], next[index]]
+    updateLeftSignaturePlacements(next)
+  }
+
+  function updateFillSignFieldsForDocument(
+    document: (PdfFile & { fillSignFields?: FillSignField[] }) | SplitPaneDocument | null,
+    nextFields: FillSignField[],
+  ) {
+    if (!document) return
+    const previousFields =
+      document.id === pdfFile?.id ? fillSignFields : document.fillSignFields ?? []
+    const generation = ++fillSignSaveGenerationRef.current
+    const documentFields = nextFields.map((field) => ({ ...field, documentId: document.id }))
+
+    if (document.id === pdfFile?.id) {
+      setFillSignFields(documentFields)
+    }
+    setRightDocument((current) =>
+      current?.id === document.id ? { ...current, fillSignFields: documentFields } : current,
+    )
+
+    window.clearTimeout(fillSignSaveTimeoutRef.current)
+    fillSignSaveTimeoutRef.current = window.setTimeout(() => {
+      window.electronAPI
+        .savePdfFillSignFields(
+          {
+            id: document.id,
+            fileSize: document.fileSize,
+            modifiedAt: document.modifiedAt,
+          },
+          documentFields,
+        )
+        .then((savedFields) => {
+          if (fillSignSaveGenerationRef.current !== generation) return
+          if (document.id === pdfFile?.id) {
+            setFillSignFields(savedFields)
+          }
+          setRightDocument((current) =>
+            current?.id === document.id ? { ...current, fillSignFields: savedFields } : current,
+          )
+        })
+        .catch((error) => {
+          if (fillSignSaveGenerationRef.current !== generation) return
+          if (document.id === pdfFile?.id) {
+            setFillSignFields(previousFields)
+          }
+          setRightDocument((current) =>
+            current?.id === document.id ? { ...current, fillSignFields: previousFields } : current,
+          )
+          setErrorMessage(`Fill & Sign save failed: ${getErrorMessage(error)}`)
+        })
+    }, 250)
+  }
+
+  function updateLeftFillSignFields(nextFields: FillSignField[]) {
+    updateFillSignFieldsForDocument(pdfFile, nextFields)
+  }
+
+  function updateRightFillSignFields(documentId: string, nextFields: FillSignField[]) {
+    const document = rightDocument?.id === documentId ? rightDocument : null
+    updateFillSignFieldsForDocument(document, nextFields)
+  }
+
+  function addLeftFillSignField(field: FillSignField) {
+    updateLeftFillSignFields([...fillSignFields, field])
+    setSelectedFillSignFieldId(field.id)
+  }
+
+  function updateLeftFillSignField(fieldId: string, patch: Partial<FillSignField>) {
+    updateLeftFillSignFields(
+      fillSignFields.map((field) =>
+        field.id === fieldId ? { ...field, ...patch } : field,
+      ),
+    )
+  }
+
+  function deleteLeftFillSignField(fieldId: string) {
+    if (!window.confirm('Delete this Fill & Sign field?')) return
+    updateLeftFillSignFields(fillSignFields.filter((field) => field.id !== fieldId))
+    setSelectedFillSignFieldId(null)
+  }
+
+  function duplicateLeftFillSignField(fieldId: string) {
+    const field = fillSignFields.find((candidate) => candidate.id === fieldId)
+    if (!field) return
+    const duplicate = duplicateFillSignField(field)
+    updateLeftFillSignFields([...fillSignFields, duplicate])
+    setSelectedFillSignFieldId(duplicate.id)
   }
 
   function clearHighlightSelection() {
@@ -1904,6 +2853,14 @@ function App() {
     setHighlightContextMenu(null)
     goToPage(highlight.pageNumber, 'auto')
     scrollToHighlightWhenReady(highlight.id, highlight.pageNumber)
+  }
+
+  function navigateSidebarHighlight(highlight: PdfHighlight) {
+    if (splitEnabled && sidebarPaneId === 'right') {
+      rightPaneRef.current?.navigateToHighlight(highlight.id, highlight.pageNumber)
+      return
+    }
+    navigateToHighlight(highlight)
   }
 
   function scrollToHighlightWhenReady(highlightId: string, pageNumber: number, attempt = 0) {
@@ -2092,7 +3049,39 @@ function App() {
     backgroundDocumentTaskRef.current = window.setTimeout(() => {
       void loadPdfOutline(document)
       void loadDocumentMetadata(document)
+      if (pdfFile) void extractAndStoreReference(document, pdfFile).catch((error) => console.warn('Reference extraction failed:', getErrorMessage(error)))
+      void startGlobalSearchIndexing(document)
     }, 250)
+  }
+
+  async function startGlobalSearchIndexing(document: PDFDocumentProxy) {
+    const source = pdfFile
+    if (!source) return
+    searchIndexAbortRef.current?.abort()
+    const controller = new AbortController()
+    searchIndexAbortRef.current = controller
+    setSearchIndexProgress({ indexed: 0, total: document.numPages })
+    try {
+      const result = await indexPdfForGlobalSearch(
+        document,
+        source,
+        controller.signal,
+        (indexed, total) => setSearchIndexProgress({ indexed, total }),
+      )
+      if (!controller.signal.aborted && result.indexed) {
+        setSearchIndexProgress({ indexed: document.numPages, total: document.numPages })
+        window.setTimeout(() => {
+          if (searchIndexAbortRef.current === controller) setSearchIndexProgress(null)
+        }, 1500)
+      } else if (!controller.signal.aborted) {
+        setSearchIndexProgress(null)
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setSearchIndexProgress(null)
+        console.warn('Global search indexing failed:', getErrorMessage(error))
+      }
+    }
   }
 
   async function loadReferencePageDimensions(
@@ -2236,7 +3225,1074 @@ function App() {
     }
   }
 
-  async function openPdf() {
+  function getCurrentTabState(): PdfTabState {
+    const currentPageElement = pageRefs.current.get(currentPageRef.current)
+    const pageBounds = currentPageElement?.getBoundingClientRect()
+    const viewportTop = headerRef.current?.offsetHeight ?? 0
+    const pageOffset = pageBounds
+      ? Math.min(1, Math.max(0, (viewportTop - pageBounds.top) / pageBounds.height))
+      : 0
+    return {
+      page: Math.max(1, currentPageRef.current),
+      pageOffset,
+      zoom: clampScale(displayZoomRef.current),
+      fitMode: zoomMode === 'fit-width',
+      rotation: normalizeRotation(rotation),
+      searchOpen,
+      searchQuery,
+      selectedMatchIndex,
+      sidebarOpen: thumbnailSidebarOpen,
+      sidebarTab,
+      sidebarWidth,
+    }
+  }
+
+  function updateTabCollections(nextTabs: PdfTab[], nextClosedTabs: PdfTab[]) {
+    tabsRef.current = nextTabs
+    closedTabsRef.current = nextClosedTabs
+    setTabs(nextTabs)
+    setClosedTabs(nextClosedTabs)
+  }
+
+  function assignPane(side: PaneSide, tab: PdfTab | null, state?: PdfTabState | null) {
+    const assignment: PaneAssignment = tab
+      ? {
+          id: side,
+          tabId: tab.tabId,
+          documentId: tab.documentId,
+          fileName: tab.name,
+          state: { ...(state ?? tab.state) },
+        }
+      : emptyPane(side)
+    if (side === 'left') {
+      leftPaneAssignmentRef.current = assignment
+      setLeftPane(assignment)
+    } else {
+      rightPaneAssignmentRef.current = assignment
+      setRightPane(assignment)
+    }
+    return assignment
+  }
+
+  function updatePaneAssignmentState(side: PaneSide, state: PdfTabState) {
+    const current = side === 'left'
+      ? leftPaneAssignmentRef.current
+      : rightPaneAssignmentRef.current
+    if (!current.tabId || tabStatesEqual(current.state ?? state, state)) {
+      return
+    }
+    const next = { ...current, state }
+    if (side === 'left') {
+      leftPaneAssignmentRef.current = next
+      setLeftPane(next)
+    } else {
+      rightPaneAssignmentRef.current = next
+      setRightPane(next)
+    }
+  }
+
+  function snapshotActiveTab() {
+    const tabId = leftPaneAssignmentRef.current.tabId
+    if (!tabId || !pdfFile) {
+      return tabsRef.current
+    }
+
+    const state = getCurrentTabState()
+    updatePaneAssignmentState('left', state)
+    const nextTabs = tabsRef.current.map((tab) =>
+      tab.tabId === tabId ? { ...tab, state } : tab,
+    )
+    updateTabCollections(nextTabs, closedTabsRef.current)
+    return nextTabs
+  }
+
+  function getWorkspaceSnapshot(): WorkspaceSession {
+    const currentTabs = snapshotActiveTab()
+    const left = leftPaneAssignmentRef.current
+    const currentLeftState = left.tabId && pdfFile ? getCurrentTabState() : left.state
+    return {
+      tabs: currentTabs.map((tab) => tab.tabId === left.tabId && currentLeftState ? { ...tab, state: currentLeftState } : tab),
+      activeTabId: activeTabIdRef.current,
+      closedTabs: closedTabsRef.current,
+      split: {
+        enabled: splitEnabled,
+        dividerRatio: splitRatio,
+        activePane,
+        leftPane: { ...left, state: currentLeftState },
+        rightPane: rightPaneAssignmentRef.current,
+        syncScrolling,
+      },
+    }
+  }
+
+  async function applyWorkspaceSession(workspace: WorkspaceSession) {
+    workspaceReadyRef.current = false
+    window.clearTimeout(workspaceSaveTimeoutRef.current)
+    rightPaneLoadGenerationRef.current += 1
+    clearViewer()
+    setRightDocument(null)
+    assignPane('left', null)
+    assignPane('right', null)
+    updateTabCollections(workspace.tabs, workspace.closedTabs)
+    setSplitRatio(workspace.split.dividerRatio)
+
+    const targetTab =
+      workspace.tabs.find((tab) => tab.tabId === workspace.split.leftPane.tabId) ??
+      workspace.tabs.find((tab) => tab.tabId === workspace.activeTabId) ??
+      workspace.tabs[0]
+    if (!targetTab) {
+      setSplitEnabled(false)
+      activeTabIdRef.current = null
+      setActiveTabId(null)
+      workspaceReadyRef.current = true
+      return
+    }
+
+    const restoreCandidates = [targetTab, ...workspace.tabs.filter((tab) => tab.tabId !== targetTab.tabId)]
+    for (const candidate of restoreCandidates) {
+      if (!tabsRef.current.some((tab) => tab.tabId === candidate.tabId)) continue
+      await activateTab(
+        candidate.tabId,
+        undefined,
+        workspace.split.leftPane.tabId === candidate.tabId
+          ? workspace.split.leftPane.state ?? candidate.state
+          : candidate.state,
+        true,
+      )
+      if (leftPaneAssignmentRef.current.tabId === candidate.tabId) break
+    }
+
+    const leftRestored = Boolean(leftPaneAssignmentRef.current.tabId)
+    if (leftRestored && workspace.split.enabled && workspace.split.rightPane.tabId) {
+      await openTabInRightPane(workspace.split.rightPane.tabId, {
+        preserveSidebar: true,
+        activate: false,
+        state: workspace.split.rightPane.state,
+      })
+    }
+    const splitRestored = leftRestored && workspace.split.enabled
+    setSplitEnabled(splitRestored)
+    const restoredActivePane: PaneSide = splitRestored && workspace.split.activePane === 'right' && rightPaneAssignmentRef.current.tabId ? 'right' : 'left'
+    setActivePane(restoredActivePane)
+    const restoredActiveTabId = restoredActivePane === 'right'
+      ? rightPaneAssignmentRef.current.tabId ?? leftPaneAssignmentRef.current.tabId
+      : leftPaneAssignmentRef.current.tabId ?? rightPaneAssignmentRef.current.tabId
+    activeTabIdRef.current = restoredActiveTabId
+    setActiveTabId(restoredActiveTabId)
+    workspaceReadyRef.current = true
+  }
+
+  async function refreshWorkspaceManager(selectedId?: string) {
+    setWorkspaceLoading(true)
+    setWorkspaceError(null)
+    try {
+      const list = await window.electronAPI.listWorkspaces()
+      setWorkspaceList(list.workspaces)
+      setActiveWorkspaceId(list.activeWorkspaceId)
+      const targetId = selectedId && list.workspaces.some((workspace) => workspace.id === selectedId)
+        ? selectedId
+        : workspaceDetails?.id && list.workspaces.some((workspace) => workspace.id === workspaceDetails.id)
+          ? workspaceDetails.id
+          : list.activeWorkspaceId
+      setWorkspaceDetails(await window.electronAPI.getWorkspaceDetails(targetId))
+    } catch (error) {
+      setWorkspaceError(getErrorMessage(error))
+    } finally {
+      setWorkspaceLoading(false)
+    }
+  }
+
+  async function switchToWorkspace(id: string) {
+    if (id === activeWorkspaceId) {
+      setWorkspaceManagerOpen(false)
+      return
+    }
+    workspaceSwitchingRef.current = true
+    setWorkspaceLoading(true)
+    setWorkspaceError(null)
+    try {
+      const result = await window.electronAPI.switchWorkspace(id, getWorkspaceSnapshot())
+      setActiveWorkspaceId(result.workspace.id)
+      await applyWorkspaceSession(result.session)
+      await refreshWorkspaceManager(result.workspace.id)
+      setWorkspaceManagerOpen(false)
+    } catch (error) {
+      setWorkspaceError(getErrorMessage(error))
+    } finally {
+      workspaceSwitchingRef.current = false
+      workspaceReadyRef.current = true
+      setWorkspaceLoading(false)
+    }
+  }
+
+  async function importWorkspace() {
+    workspaceSwitchingRef.current = true
+    try {
+      await window.electronAPI.saveWorkspace(getWorkspaceSnapshot())
+      const imported = await window.electronAPI.importWorkspace()
+      if (!imported) return
+      setActiveWorkspaceId(imported.workspace.id)
+      await applyWorkspaceSession(imported.session)
+      await refreshWorkspaceManager(imported.workspace.id)
+      if (imported.missingFiles.length) {
+        setWorkspaceError(`Imported with ${imported.missingFiles.length} missing file reference${imported.missingFiles.length === 1 ? '' : 's'}.`)
+      }
+    } catch (error) {
+      setWorkspaceError(getErrorMessage(error))
+    } finally {
+      workspaceSwitchingRef.current = false
+    }
+  }
+
+  async function deleteWorkspace(id: string) {
+    workspaceSwitchingRef.current = true
+    try {
+      const result = await window.electronAPI.deleteWorkspace(id)
+      setActiveWorkspaceId(result.activeWorkspaceId)
+      if (result.deletedActive) await applyWorkspaceSession(result.session)
+      await refreshWorkspaceManager(result.activeWorkspaceId)
+    } finally {
+      workspaceSwitchingRef.current = false
+      workspaceReadyRef.current = true
+    }
+  }
+
+  async function openWorkspaceManager() {
+    setGlobalDashboardOpen(false)
+    setGlobalSearchOpen(false)
+    setReferencesOpen(false)
+    setMergePdfsOpen(false)
+    setImagesToPdfOpen(false)
+    setSignatureManagerOpen(false)
+    setWorkspaceManagerOpen(true)
+    await refreshWorkspaceManager(activeWorkspaceId || undefined)
+  }
+
+  function loadDocumentOnce(documentId: string) {
+    const existing = documentLoadPromisesRef.current.get(documentId)
+    if (existing) return existing
+    const pending = window.electronAPI.openRecentPdf(documentId)
+      .finally(() => documentLoadPromisesRef.current.delete(documentId))
+    documentLoadPromisesRef.current.set(documentId, pending)
+    return pending
+  }
+
+  function navigateWorkspaceHighlight(entry: HighlightLibraryEntry, pane: PaneSide, attempt = 0) {
+    console.info('Navigation target page:', entry.pageNumber)
+    if (pane === 'right') {
+      if (rightPaneRef.current && rightPaneAssignmentRef.current.documentId === entry.documentId) {
+        rightPaneRef.current.navigateToHighlight(entry.highlightId, entry.pageNumber)
+      } else if (attempt < 90 && rightPaneAssignmentRef.current.documentId === entry.documentId) {
+        window.setTimeout(() => navigateWorkspaceHighlight(entry, pane, attempt + 1), 16)
+      }
+      return
+    }
+    const highlight = highlights.find((candidate) => candidate.id === entry.highlightId)
+    if (highlight) navigateToHighlight(highlight)
+    else goToPage(entry.pageNumber, 'auto')
+  }
+
+  async function openWorkspaceDocument(
+    documentId: string,
+    options: WorkspaceNavigationOptions = {},
+  ) {
+    const existingTab = tabsRef.current.find((tab) => tab.documentId === documentId)
+    const rightIsLoaded = rightPaneAssignmentRef.current.documentId === documentId && rightDocument?.id === documentId
+    const leftIsLoaded = leftPaneAssignmentRef.current.documentId === documentId && pdfFile?.id === documentId
+    console.info('Workspace click documentId:', documentId)
+    console.info('Document already open:', Boolean(existingTab))
+    console.info('Existing tabId:', existingTab?.tabId ?? 'none')
+    console.info('Load state:', documentLoadPromisesRef.current.has(documentId) ? 'loading' : rightIsLoaded || leftIsLoaded ? 'loaded' : 'idle')
+    console.info('Navigation target page:', options.highlight?.pageNumber ?? 'none')
+    console.info('Indexing triggered:', false)
+
+    try {
+      if (options.workspaceId && options.workspaceId !== activeWorkspaceId) {
+        await switchToWorkspace(options.workspaceId)
+        window.requestAnimationFrame(() => void openWorkspaceDocumentRef.current(documentId, options))
+        return
+      }
+
+      setWorkspaceManagerOpen(false)
+      setWorkspaceError(null)
+      setErrorMessage(null)
+      if (rightIsLoaded) {
+        focusPane('right')
+        if (options.highlight) navigateWorkspaceHighlight(options.highlight, 'right')
+        return
+      }
+      if (leftIsLoaded) {
+        focusPane('left')
+        if (options.highlight) navigateWorkspaceHighlight(options.highlight, 'left')
+        return
+      }
+      if (existingTab) {
+        if (rightPaneAssignmentRef.current.tabId === existingTab.tabId) {
+          await openTabInRightPane(existingTab.tabId)
+          if (options.highlight) navigateWorkspaceHighlight(options.highlight, 'right')
+        } else {
+          if (options.highlight) setPendingLibraryNavigation(options.highlight)
+          await activateTab(existingTab.tabId)
+        }
+        return
+      }
+
+      setIsLoading(true)
+      setLoadingProgress('Reading PDF file...')
+      let handedToViewer = false
+      try {
+        const result = await loadDocumentOnce(documentId)
+        const racedTab = tabsRef.current.find((tab) => tab.documentId === documentId)
+        if (options.highlight) setPendingLibraryNavigation(options.highlight)
+        if (racedTab) await activateTab(racedTab.tabId, result)
+        else openResultInTab(result)
+        handedToViewer = true
+        void refreshRecentFiles()
+      } finally {
+        if (!handedToViewer) {
+          setIsLoading(false)
+          setLoadingProgress(null)
+        }
+      }
+    } catch (error) {
+      setPendingLibraryNavigation(null)
+      setIsLoading(false)
+      setLoadingProgress(null)
+      const message = getErrorMessage(error)
+      setWorkspaceError(message)
+      setErrorMessage(`Could not open workspace document: ${message}`)
+      if (/no longer|does not exist|not available|missing/i.test(message)) {
+        void refreshWorkspaceManager(workspaceDetails?.id)
+      }
+    }
+  }
+
+  async function restoreWorkspace() {
+    try {
+      const [workspace, defaultSidebarTab, defaultSidebarLayout, workspaceCollection] = await Promise.all([
+        window.electronAPI.getWorkspace(),
+        window.electronAPI.getSidebarTab(),
+        window.electronAPI.getSidebarLayout(),
+        window.electronAPI.listWorkspaces(),
+      ])
+      setSidebarTab(defaultSidebarTab)
+      setSidebarWidth(defaultSidebarLayout.width)
+      setThumbnailSidebarOpen(!defaultSidebarLayout.collapsed)
+      setWorkspaceList(workspaceCollection.workspaces)
+      setActiveWorkspaceId(workspaceCollection.activeWorkspaceId)
+      await applyWorkspaceSession(workspace)
+      setWorkspaceDetails(await window.electronAPI.getWorkspaceDetails(workspaceCollection.activeWorkspaceId))
+    } catch (error) {
+      workspaceReadyRef.current = true
+      setErrorMessage(`Workspace restore failed: ${getErrorMessage(error)}`)
+    }
+  }
+
+  function openResultInTab(
+    result: OpenedPdf,
+    options: { duplicate?: boolean; state?: PdfTabState; targetPane?: PaneSide } = {},
+  ) {
+    const targetPane = splitEnabled ? options.targetPane ?? activePane : 'left'
+    const existingTab = !options.duplicate
+      ? tabsRef.current.find((tab) => tab.documentId === result.id)
+      : undefined
+    if (existingTab) {
+      if (targetPane === 'right') {
+        void openTabInRightPane(existingTab.tabId, { loadedResult: result })
+      } else if (existingTab.tabId !== leftPaneAssignmentRef.current.tabId) {
+        void activateTab(existingTab.tabId, result)
+      } else {
+        activeTabIdRef.current = existingTab.tabId
+        setActiveTabId(existingTab.tabId)
+        setActivePane('left')
+      }
+      return
+    }
+
+    tabSwitchGenerationRef.current += 1
+    const currentTabs = snapshotActiveTab()
+    const tab: PdfTab = {
+      tabId: createTabId(),
+      documentId: result.id,
+      name: result.name,
+      state: options.state ?? createTabState(result.readingState, {
+        sidebarOpen: thumbnailSidebarOpen,
+        sidebarTab,
+        sidebarWidth,
+      }),
+    }
+    const nextTabs = [...currentTabs, tab]
+    updateTabCollections(nextTabs, closedTabsRef.current)
+    if (targetPane === 'right') {
+      void openTabInRightPane(tab.tabId, { loadedResult: result, state: tab.state })
+      return
+    }
+    assignPane('left', tab, tab.state)
+    activeTabIdRef.current = tab.tabId
+    setActiveTabId(tab.tabId)
+    setActivePane('left')
+    loadOpenedPdf(result, tab.state)
+  }
+
+  async function activateTab(
+    tabId: string,
+    loadedResult?: OpenedPdf,
+    stateOverride?: PdfTabState | null,
+    leavePaneEmptyOnError = false,
+  ) {
+    if (tabId === leftPaneAssignmentRef.current.tabId && pdfFile) {
+      activeTabIdRef.current = tabId
+      setActiveTabId(tabId)
+      setActivePane('left')
+      return
+    }
+
+    const currentTabs = snapshotActiveTab()
+    const tab = currentTabs.find((candidate) => candidate.tabId === tabId)
+    if (!tab) {
+      return
+    }
+
+    clearViewer()
+    const generation = ++tabSwitchGenerationRef.current
+    const paneState = { ...(stateOverride ?? tab.state) }
+    assignPane('left', tab, paneState)
+    activeTabIdRef.current = tabId
+    setActiveTabId(tabId)
+    setActivePane('left')
+    setTabContextMenu(null)
+    setErrorMessage(null)
+    setIsLoading(true)
+    setLoadingProgress(`Opening ${tab.name}...`)
+
+    try {
+      const result = loadedResult ?? (await loadDocumentOnce(tab.documentId))
+      if (tabSwitchGenerationRef.current !== generation) {
+        return
+      }
+      if (result.id !== tab.documentId) {
+        throw new Error(`Document routing mismatch for ${tab.name}.`)
+      }
+      loadOpenedPdf(result, paneState)
+      void refreshRecentFiles()
+    } catch (error) {
+      if (tabSwitchGenerationRef.current !== generation) {
+        return
+      }
+      setErrorMessage(`Could not restore ${tab.name}: ${getErrorMessage(error)}`)
+      if (leavePaneEmptyOnError) {
+        updateTabCollections(
+          tabsRef.current.filter((candidate) => candidate.tabId !== tabId),
+          closedTabsRef.current,
+        )
+        assignPane('left', null)
+        activeTabIdRef.current = null
+        setActiveTabId(null)
+        clearViewer()
+      } else {
+        removeUnavailableTab(tabId)
+      }
+      void refreshRecentFiles()
+    }
+  }
+
+  function removeUnavailableTab(tabId: string) {
+    const currentTabs = tabsRef.current
+    const index = currentTabs.findIndex((tab) => tab.tabId === tabId)
+    const nextTabs = currentTabs.filter((tab) => tab.tabId !== tabId)
+    updateTabCollections(nextTabs, closedTabsRef.current)
+    const wasLeft = leftPaneAssignmentRef.current.tabId === tabId
+    const wasRight = rightPaneAssignmentRef.current.tabId === tabId
+    if (wasRight) {
+      rightPaneLoadGenerationRef.current += 1
+      assignPane('right', null)
+      setRightDocument(null)
+      setSplitEnabled(Boolean(leftPaneAssignmentRef.current.tabId))
+    }
+    if (wasLeft) {
+      assignPane('left', null)
+      clearViewer()
+    }
+    const nextTab = nextTabs[Math.min(Math.max(0, index), nextTabs.length - 1)]
+    if (wasLeft && nextTab) {
+      void activateTab(nextTab.tabId)
+    } else if (activeTabIdRef.current === tabId) {
+      const fallbackTabId = leftPaneAssignmentRef.current.tabId ?? rightPaneAssignmentRef.current.tabId
+      activeTabIdRef.current = fallbackTabId
+      setActiveTabId(fallbackTabId)
+      setActivePane(leftPaneAssignmentRef.current.tabId ? 'left' : 'right')
+    }
+  }
+
+  async function closeTab(tabId: string) {
+    const closingLeft = leftPaneAssignmentRef.current.tabId === tabId
+    const closingRight = rightPaneAssignmentRef.current.tabId === tabId
+    if (closingRight && rightPaneRef.current) {
+      updateRightTabState(rightPaneRef.current.getState())
+    }
+    if (closingLeft) {
+      snapshotActiveTab()
+    }
+    const currentTabs = tabsRef.current
+    const index = currentTabs.findIndex((tab) => tab.tabId === tabId)
+    if (index < 0) {
+      return
+    }
+
+    const sourceState = closingRight
+      ? rightPaneAssignmentRef.current.state
+      : closingLeft
+        ? leftPaneAssignmentRef.current.state
+        : null
+    const closedTab = sourceState ? { ...currentTabs[index], state: sourceState } : currentTabs[index]
+    const nextTabs = currentTabs.filter((tab) => tab.tabId !== tabId)
+    const nextClosedTabs = [closedTab, ...closedTabsRef.current.filter((tab) => tab.tabId !== tabId)]
+      .slice(0, 20)
+    updateTabCollections(nextTabs, nextClosedTabs)
+    setTabContextMenu(null)
+
+    if (closingRight) {
+      rightPaneLoadGenerationRef.current += 1
+      assignPane('right', null)
+      setRightDocument(null)
+      setSplitEnabled(Boolean(leftPaneAssignmentRef.current.tabId))
+    }
+
+    if (closingLeft) {
+      const keepRightActive = activePane === 'right' && !closingRight
+      assignPane('left', null)
+      clearViewer()
+      const nextTab = nextTabs[Math.min(index, nextTabs.length - 1)]
+      if (nextTab) {
+        await activateTab(nextTab.tabId)
+        if (keepRightActive && rightPaneAssignmentRef.current.tabId) {
+          activeTabIdRef.current = rightPaneAssignmentRef.current.tabId
+          setActiveTabId(rightPaneAssignmentRef.current.tabId)
+          setActivePane('right')
+        }
+      }
+    } else if (activeTabIdRef.current === tabId) {
+      const fallbackTabId = leftPaneAssignmentRef.current.tabId ?? rightPaneAssignmentRef.current.tabId
+      activeTabIdRef.current = fallbackTabId
+      setActiveTabId(fallbackTabId)
+      setActivePane(leftPaneAssignmentRef.current.tabId ? 'left' : 'right')
+    } else if (closingRight) {
+      const fallbackTabId = leftPaneAssignmentRef.current.tabId
+      activeTabIdRef.current = fallbackTabId
+      setActiveTabId(fallbackTabId)
+      setActivePane('left')
+    }
+  }
+
+  function cycleTabs(direction: -1 | 1) {
+    const currentTabs = tabsRef.current
+    if (currentTabs.length < 2) {
+      return
+    }
+    const currentIndex = currentTabs.findIndex((tab) => tab.tabId === activeTabIdRef.current)
+    const nextIndex = (currentIndex + direction + currentTabs.length) % currentTabs.length
+    activateTabForPane(currentTabs[nextIndex].tabId)
+  }
+
+  async function restoreClosedTab() {
+    const [closedTab, ...remainingClosedTabs] = closedTabsRef.current
+    if (!closedTab) {
+      return
+    }
+
+    setErrorMessage(null)
+    setIsLoading(true)
+    setLoadingProgress(`Restoring ${closedTab.name}...`)
+    try {
+      const result = await window.electronAPI.openRecentPdf(closedTab.documentId)
+      updateTabCollections(tabsRef.current, remainingClosedTabs)
+      openResultInTab(result, {
+        duplicate: true,
+        state: closedTab.state,
+      })
+    } catch (error) {
+      updateTabCollections(tabsRef.current, remainingClosedTabs)
+      setIsLoading(false)
+      setLoadingProgress(null)
+      setErrorMessage(`Could not restore ${closedTab.name}: ${getErrorMessage(error)}`)
+    }
+  }
+
+  async function duplicateTab(tabId: string) {
+    if (tabId === leftPaneAssignmentRef.current.tabId) {
+      snapshotActiveTab()
+    }
+    if (tabId === rightPaneAssignmentRef.current.tabId && rightPaneRef.current) {
+      updateRightTabState(rightPaneRef.current.getState())
+    }
+    const sourceTabRecord = tabsRef.current.find((tab) => tab.tabId === tabId)
+    const paneState = tabId === rightPaneAssignmentRef.current.tabId
+      ? rightPaneAssignmentRef.current.state
+      : tabId === leftPaneAssignmentRef.current.tabId
+        ? leftPaneAssignmentRef.current.state
+        : null
+    const sourceTab = sourceTabRecord && paneState
+      ? { ...sourceTabRecord, state: paneState }
+      : sourceTabRecord
+    if (!sourceTab) {
+      return
+    }
+
+    setTabContextMenu(null)
+    setIsLoading(true)
+    setLoadingProgress(`Duplicating ${sourceTab.name}...`)
+    try {
+      const result = await window.electronAPI.openRecentPdf(sourceTab.documentId)
+      openResultInTab(result, { duplicate: true, state: sourceTab.state })
+    } catch (error) {
+      setIsLoading(false)
+      setLoadingProgress(null)
+      setErrorMessage(`Could not duplicate ${sourceTab.name}: ${getErrorMessage(error)}`)
+    }
+  }
+
+  function closeOtherTabs(tabId: string) {
+    if (rightPaneAssignmentRef.current.tabId && rightPaneRef.current) {
+      updateRightTabState(rightPaneRef.current.getState())
+    }
+    const currentTabs = snapshotActiveTab()
+    const keptTab = currentTabs.find((tab) => tab.tabId === tabId)
+    if (!keptTab) {
+      return
+    }
+    const removedTabs = currentTabs.filter((tab) => tab.tabId !== tabId)
+    updateTabCollections(
+      [keptTab],
+      [...removedTabs.reverse(), ...closedTabsRef.current].slice(0, 20),
+    )
+    rightPaneLoadGenerationRef.current += 1
+    assignPane('right', null)
+    setRightDocument(null)
+    setSplitEnabled(false)
+    setTabContextMenu(null)
+    if (leftPaneAssignmentRef.current.tabId !== tabId) {
+      void activateTab(tabId)
+    } else {
+      activeTabIdRef.current = tabId
+      setActiveTabId(tabId)
+      setActivePane('left')
+    }
+  }
+
+  function closeTabsToRight(tabId: string) {
+    const currentTabs = snapshotActiveTab()
+    const index = currentTabs.findIndex((tab) => tab.tabId === tabId)
+    if (index < 0 || index === currentTabs.length - 1) {
+      setTabContextMenu(null)
+      return
+    }
+    const nextTabs = currentTabs.slice(0, index + 1)
+    const removedTabs = currentTabs.slice(index + 1)
+    updateTabCollections(
+      nextTabs,
+      [...removedTabs.reverse(), ...closedTabsRef.current].slice(0, 20),
+    )
+    const removedTabIds = new Set(removedTabs.map((tab) => tab.tabId))
+    if (rightPaneAssignmentRef.current.tabId && removedTabIds.has(rightPaneAssignmentRef.current.tabId)) {
+      rightPaneLoadGenerationRef.current += 1
+      assignPane('right', null)
+      setRightDocument(null)
+      setSplitEnabled(false)
+    }
+    setTabContextMenu(null)
+    if (leftPaneAssignmentRef.current.tabId && removedTabIds.has(leftPaneAssignmentRef.current.tabId)) {
+      void activateTab(tabId)
+    } else if (!nextTabs.some((tab) => tab.tabId === activeTabIdRef.current)) {
+      focusPane('left')
+    }
+  }
+
+  function reorderTab(draggedTabId: string, targetTabId: string) {
+    if (draggedTabId === targetTabId) {
+      return
+    }
+    const currentTabs = tabsRef.current
+    const fromIndex = currentTabs.findIndex((tab) => tab.tabId === draggedTabId)
+    const toIndex = currentTabs.findIndex((tab) => tab.tabId === targetTabId)
+    if (fromIndex < 0 || toIndex < 0) {
+      return
+    }
+    const nextTabs = [...currentTabs]
+    const [movedTab] = nextTabs.splice(fromIndex, 1)
+    nextTabs.splice(toIndex, 0, movedTab)
+    updateTabCollections(nextTabs, closedTabsRef.current)
+  }
+
+  async function revealTabFile(tabId: string) {
+    const tab = tabsRef.current.find((candidate) => candidate.tabId === tabId)
+    setTabContextMenu(null)
+    if (!tab) {
+      return
+    }
+    try {
+      await window.electronAPI.revealPdf(tab.documentId)
+    } catch (error) {
+      setErrorMessage(`Could not reveal ${tab.name}: ${getErrorMessage(error)}`)
+    }
+  }
+
+  async function openTabInRightPane(
+    requestedTabId: string,
+    options: {
+      activate?: boolean
+      preserveSidebar?: boolean
+      state?: PdfTabState | null
+      loadedResult?: OpenedPdf
+    } = {},
+  ) {
+    const currentRightPane = rightPaneAssignmentRef.current
+    const existingTab = tabsRef.current.find((tab) => tab.tabId === requestedTabId)
+    if (!existingTab) {
+      return
+    }
+    if (
+      requestedTabId === currentRightPane.tabId &&
+      rightDocument?.id === existingTab.documentId
+    ) {
+      setSplitEnabled(true)
+      if (options.activate !== false) {
+        activeTabIdRef.current = requestedTabId
+        setActiveTabId(requestedTabId)
+        setActivePane('right')
+      }
+      return
+    }
+    if (currentRightPane.tabId && rightPaneRef.current) {
+      updateRightTabState(rightPaneRef.current.getState())
+    }
+    snapshotActiveTab()
+    const tab = tabsRef.current.find((candidate) => candidate.tabId === requestedTabId)
+    if (!tab) {
+      return
+    }
+
+    const generation = ++rightPaneLoadGenerationRef.current
+    const sourceState = options.state ?? (
+      tab.tabId === leftPaneAssignmentRef.current.tabId
+        ? leftPaneAssignmentRef.current.state ?? tab.state
+        : tab.state
+    )
+    const paneState = options.preserveSidebar
+      ? { ...sourceState }
+      : { ...sourceState, sidebarOpen: false }
+    setErrorMessage(null)
+    setLoadingProgress(`Opening ${tab.name} in right pane...`)
+    if (options.activate !== false) {
+      activeTabIdRef.current = tab.tabId
+      setActiveTabId(tab.tabId)
+      setActivePane('right')
+    }
+    try {
+      const result = options.loadedResult ?? (await loadDocumentOnce(tab.documentId))
+      if (generation !== rightPaneLoadGenerationRef.current) {
+        return
+      }
+      if (result.id !== tab.documentId) {
+        throw new Error(`Document routing mismatch for ${tab.name}.`)
+      }
+      assignPane('right', tab, paneState)
+      setRightDocument({
+        id: result.id,
+        name: result.name,
+        filePath: result.filePath,
+        fileSize: result.fileSize,
+        modifiedAt: result.modifiedAt,
+        dataUrl: result.dataUrl,
+        highlights: result.highlights ?? [],
+        signaturePlacements: result.signaturePlacements ?? [],
+        fillSignFields: result.fillSignFields ?? [],
+      })
+      setSplitEnabled(true)
+      if (options.activate !== false) {
+        activeTabIdRef.current = tab.tabId
+        setActiveTabId(tab.tabId)
+        setActivePane('right')
+      }
+      setLoadingProgress(null)
+      void refreshRecentFiles()
+    } catch (error) {
+      if (generation === rightPaneLoadGenerationRef.current) {
+        setLoadingProgress(null)
+        setErrorMessage(`Could not open ${tab.name} in split view: ${getErrorMessage(error)}`)
+        const missingDocument = /no longer|does not exist|not available/i.test(getErrorMessage(error))
+        if (missingDocument) {
+          removeUnavailableTab(requestedTabId)
+          return
+        } else {
+          assignPane('right', null)
+          setRightDocument(null)
+          setSplitEnabled(Boolean(leftPaneAssignmentRef.current.tabId))
+        }
+        if (options.activate !== false) {
+          const fallbackTabId = currentRightPane.tabId ?? leftPaneAssignmentRef.current.tabId
+          activeTabIdRef.current = fallbackTabId
+          setActiveTabId(fallbackTabId)
+          setActivePane(currentRightPane.tabId ? 'right' : 'left')
+        }
+      }
+    }
+  }
+
+  async function splitCurrentTab() {
+    const currentTabId = activeTabIdRef.current ?? leftPaneAssignmentRef.current.tabId
+    if (!currentTabId) {
+      await openPdf()
+      return
+    }
+    const currentTab = tabsRef.current.find((tab) => tab.tabId === currentTabId)
+    if (!currentTab) {
+      return
+    }
+    const currentState = currentTabId === leftPaneAssignmentRef.current.tabId
+      ? getCurrentTabState()
+      : currentTab.state
+    await openTabInRightPane(currentTabId, { state: currentState })
+    setSplitMenuOpen(false)
+  }
+
+  function closeSplitView() {
+    if (rightTabId && rightPaneRef.current) {
+      updateRightTabState(rightPaneRef.current.getState())
+    }
+    rightPaneLoadGenerationRef.current += 1
+    setSplitEnabled(false)
+    setRightDocument(null)
+    focusPane('left')
+    setSplitMenuOpen(false)
+  }
+
+  function updateRightTabState(state: SplitPaneState) {
+    const assignment = rightPaneAssignmentRef.current
+    if (!assignment.tabId) {
+      return
+    }
+    const tab = tabsRef.current.find((candidate) => candidate.tabId === assignment.tabId)
+    if (!tab) return
+    const nextState = fromSplitPaneState(state, assignment.state ?? tab.state)
+    updatePaneAssignmentState('right', nextState)
+    let changed = false
+    const nextTabs = tabsRef.current.map((tab) => {
+      if (tab.tabId !== assignment.tabId) return tab
+      if (tabStatesEqual(tab.state, nextState)) return tab
+      changed = true
+      return { ...tab, state: nextState }
+    })
+    if (changed) {
+      updateTabCollections(nextTabs, closedTabsRef.current)
+    }
+  }
+
+  function handleSplitHighlightsChange(documentId: string, nextHighlights: PdfHighlight[]) {
+    setRightDocument((current) =>
+      current?.id === documentId ? { ...current, highlights: nextHighlights } : current,
+    )
+    if (pdfFile?.id === documentId) {
+      highlightSaveGenerationRef.current += 1
+      setHighlights(nextHighlights)
+    }
+  }
+
+  function openTabInLeftPane(tabId: string) {
+    setActivePane('left')
+    setSplitMenuOpen(false)
+    void activateTab(tabId)
+  }
+
+  function moveTabToLeftPane(tabId: string) {
+    if (tabId === rightTabId) {
+      if (rightPaneRef.current) updateRightTabState(rightPaneRef.current.getState())
+      rightPaneLoadGenerationRef.current += 1
+      setRightDocument(null)
+      assignPane('right', null)
+      setSplitEnabled(false)
+    }
+    setActivePane('left')
+    void activateTab(tabId)
+  }
+
+  function activateTabForPane(tabId: string) {
+    if (splitEnabled && activePane === 'right') {
+      void openTabInRightPane(tabId)
+    } else {
+      openTabInLeftPane(tabId)
+    }
+  }
+
+  function focusPane(side: PaneSide) {
+    const assignment = side === 'left'
+      ? leftPaneAssignmentRef.current
+      : rightPaneAssignmentRef.current
+    if (!assignment.tabId) {
+      setActivePane(side)
+      return
+    }
+    activeTabIdRef.current = assignment.tabId
+    setActiveTabId(assignment.tabId)
+    setActivePane(side)
+  }
+
+  function startSplitResize(event: React.PointerEvent<HTMLDivElement>) {
+    const container = splitContainerRef.current
+    if (!container) {
+      return
+    }
+    const splitContainer = container
+    const leftPane = leftPaneContainerRef.current
+    if (!leftPane) {
+      return
+    }
+    const splitLeftPane = leftPane
+    event.preventDefault()
+    const handle = event.currentTarget
+    const pointerId = event.pointerId
+    handle.setPointerCapture(pointerId)
+    setSplitResizing(true)
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+
+    function resize(pointerEvent: PointerEvent) {
+      const bounds = splitContainer.getBoundingClientRect()
+      const leftBounds = splitLeftPane.getBoundingClientRect()
+      const availableWidth = Math.max(1, bounds.right - leftBounds.left)
+      setSplitRatio(
+        Math.min(0.75, Math.max(0.25, (pointerEvent.clientX - leftBounds.left) / availableWidth)),
+      )
+    }
+
+    function finish() {
+      window.removeEventListener('pointermove', resize)
+      window.removeEventListener('pointerup', finish)
+      window.removeEventListener('pointercancel', finish)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      if (handle.hasPointerCapture(pointerId)) {
+        handle.releasePointerCapture(pointerId)
+      }
+      setSplitResizing(false)
+    }
+
+    window.addEventListener('pointermove', resize)
+    window.addEventListener('pointerup', finish)
+    window.addEventListener('pointercancel', finish)
+  }
+
+  function applyRightScrollToLeft(position: Omit<SplitScrollPosition, 'token'>) {
+    if (!syncScrolling || suppressLeftSyncRef.current || !splitEnabled) {
+      return
+    }
+    const pageNumber = Math.min(numPages, Math.max(1, position.page))
+    ensurePageRenderWindow(pageNumber)
+    suppressLeftSyncRef.current = true
+    currentPageRef.current = pageNumber
+    setCurrentPage(pageNumber)
+    setPageInput(String(pageNumber))
+    window.requestAnimationFrame(() => {
+      const page = pageRefs.current.get(pageNumber)
+      if (page) {
+        const headerHeight = headerRef.current?.offsetHeight ?? 0
+        const bounds = page.getBoundingClientRect()
+        window.scrollTo({
+          top: window.scrollY + bounds.top - headerHeight + bounds.height * position.offset,
+          behavior: 'auto',
+        })
+      }
+      window.setTimeout(() => {
+        suppressLeftSyncRef.current = false
+      }, 100)
+    })
+  }
+
+  function goToActivePage(action: 'next' | 'previous' | 'first' | 'last') {
+    if (splitEnabled && activePane === 'right') {
+      const handle = rightPaneRef.current
+      if (action === 'next') handle?.nextPage()
+      else if (action === 'previous') handle?.previousPage()
+      else if (action === 'first') handle?.firstPage()
+      else handle?.lastPage()
+      return
+    }
+    const destination = action === 'next'
+      ? currentPageRef.current + 1
+      : action === 'previous'
+        ? currentPageRef.current - 1
+        : action === 'first'
+          ? 1
+          : numPages
+    goToPage(destination)
+  }
+
+  function changeActiveZoom(amount: number | 'reset') {
+    if (splitEnabled && activePane === 'right') {
+      if (amount === 'reset') rightPaneRef.current?.resetZoom()
+      else rightPaneRef.current?.zoomBy(amount)
+      return
+    }
+    changeZoom(amount === 'reset' ? 1 : displayZoomRef.current + amount)
+  }
+
+  function fitActivePane() {
+    if (splitEnabled && activePane === 'right') {
+      rightPaneRef.current?.fitWidth()
+    } else {
+      fitWidth()
+    }
+  }
+
+  function rotateActivePane(amount: -90 | 90) {
+    if (splitEnabled && activePane === 'right') {
+      rightPaneRef.current?.rotateBy(amount)
+    } else {
+      rotatePages(amount)
+    }
+  }
+
+  function openActivePaneSearch() {
+    if (splitEnabled && activePane === 'right') {
+      rightPaneRef.current?.openSearch()
+    } else {
+      setSearchOpen(true)
+      window.requestAnimationFrame(() => searchInputRef.current?.focus())
+    }
+  }
+
+  function clearViewer() {
+    tabSwitchGenerationRef.current += 1
+    pdfDocumentRef.current = null
+    firstPageProxyRef.current = null
+    pageRefs.current.clear()
+    pageTextCacheRef.current.clear()
+    closeSearch()
+    setPdfFile(null)
+    setPdfDocument(null)
+    setActiveDocumentId(null)
+    setNumPages(0)
+    setCurrentPage(1)
+    currentPageRef.current = 1
+    setPageInput('1')
+    setHighlights([])
+    setSignaturePlacements([])
+    setFillSignFields([])
+    setActiveFillSignTool(null)
+    setSelectedFillSignFieldId(null)
+    setSigningSignature(null)
+    setSelectedSignaturePlacementId(null)
+    setSignPickerOpen(false)
+    setOutline([])
+    setDocumentMetadata(null)
+    setIsLoading(false)
+    setLoadingProgress(null)
+    setIsRestoring(false)
+    restoringReadingStateRef.current = false
+    pendingRestorePageRef.current = null
+    pendingRestoreOffsetRef.current = 0
+  }
+
+  async function openPdf(targetPane: PaneSide = splitEnabled ? activePane : 'left') {
     setErrorMessage(null)
     setIsLoading(true)
     setLoadingProgress('Reading PDF file...')
@@ -2250,7 +4306,7 @@ function App() {
         return
       }
 
-      loadOpenedPdf(result)
+      openResultInTab(result, { targetPane })
       await refreshRecentFiles()
     } catch (error) {
       setIsLoading(false)
@@ -2259,14 +4315,17 @@ function App() {
     }
   }
 
-  async function openDroppedPdf(file: File) {
+  async function openDroppedPdf(
+    file: File,
+    targetPane: PaneSide = splitEnabled ? activePane : 'left',
+  ) {
     setErrorMessage(null)
     setIsLoading(true)
     setLoadingProgress('Reading PDF file...')
 
     try {
       const result = await window.electronAPI.openDroppedPdf(file)
-      loadOpenedPdf(result)
+      openResultInTab(result, { targetPane })
       await refreshRecentFiles()
     } catch (error) {
       setIsLoading(false)
@@ -2276,14 +4335,17 @@ function App() {
   }
 
   async function printCurrentPdf() {
-    if (!activeDocumentId || isPrinting) {
+    const documentId = splitEnabled && activePane === 'right'
+      ? rightDocument?.id ?? null
+      : activeDocumentId
+    if (!documentId || isPrinting) {
       return
     }
 
     setErrorMessage(null)
     setIsPrinting(true)
     try {
-      await window.electronAPI.printPdf(activeDocumentId)
+      await window.electronAPI.printPdf(documentId)
     } catch (error) {
       setErrorMessage(`Printing failed: ${getErrorMessage(error)}`)
     } finally {
@@ -2291,7 +4353,73 @@ function App() {
     }
   }
 
+  async function saveSignedCopy() {
+    const document = activeSignatureDocument
+    const placements = activeSignaturePlacements
+    const fields = activeFillSignFields
+    if (!document || isSavingSignedCopy) return
+    if (placements.length === 0 && fields.length === 0) {
+      setErrorMessage('No signatures or Fill & Sign fields have been added.')
+      return
+    }
+    const activeRotation = splitEnabled && activePane === 'right'
+      ? rightPaneRef.current?.getState().rotation ?? rightPaneState?.rotation ?? 0
+      : rotation
+    if (normalizeRotation(activeRotation) !== 0) {
+      setErrorMessage('Please reset page rotation before signing.')
+      return
+    }
+    if (
+      placements.some((placement) => normalizeRotation(placement.pageRotation ?? 0) !== 0) ||
+      fields.some((field) => normalizeRotation(field.pageRotation ?? 0) !== 0)
+    ) {
+      setErrorMessage('Some Fill & Sign items were placed while the page was rotated. Reset rotation, remove those items, and place them again before exporting.')
+      return
+    }
+
+    setIsSavingSignedCopy(true)
+    setErrorMessage(null)
+    setLoadingProgress('Preparing signed PDF copy...')
+    try {
+      const result = await window.electronAPI.saveSignedPdf({
+        identity: {
+          id: document.id,
+          fileSize: document.fileSize,
+          modifiedAt: document.modifiedAt,
+        },
+        placements,
+        fillSignFields: fields,
+      })
+      if (result?.openedPdf) {
+        openResultInTab(result.openedPdf, { targetPane: splitEnabled ? activePane : 'left' })
+      }
+      if (result?.outputPath) {
+        setErrorMessage(null)
+        setLoadingProgress('Signed PDF copy saved successfully.')
+        window.setTimeout(() => setLoadingProgress(null), 2200)
+      } else {
+        setLoadingProgress(null)
+      }
+      await refreshRecentFiles()
+    } catch (error) {
+      setErrorMessage(`Signed PDF export failed: ${getErrorMessage(error)}`)
+      setLoadingProgress(null)
+    } finally {
+      setIsSavingSignedCopy(false)
+    }
+  }
+
   async function exportCurrentPage(format: 'png' | 'jpeg') {
+    if (splitEnabled && activePane === 'right') {
+      setExportMenuOpen(false)
+      setIsExporting(true)
+      try {
+        await rightPaneRef.current?.exportPage(format)
+      } finally {
+        setIsExporting(false)
+      }
+      return
+    }
     if (!pdfDocument || !pdfFile || isExporting) {
       return
     }
@@ -2337,26 +4465,55 @@ function App() {
     }
   }
 
-  async function openRecentPdf(id: string) {
+  async function openRecentPdf(
+    id: string,
+    targetPane: PaneSide = splitEnabled ? activePane : 'left',
+  ) {
+    const existingTab = tabsRef.current.find((tab) => tab.documentId === id)
+    if (rightPaneAssignmentRef.current.documentId === id && rightDocument?.id === id) {
+      setWorkspaceManagerOpen(false)
+      focusPane('right')
+      return
+    }
+    if (leftPaneAssignmentRef.current.documentId === id && pdfFile?.id === id) {
+      setWorkspaceManagerOpen(false)
+      focusPane('left')
+      return
+    }
+    if (existingTab) {
+      setWorkspaceManagerOpen(false)
+      if (rightPaneAssignmentRef.current.tabId === existingTab.tabId) {
+        await openTabInRightPane(existingTab.tabId)
+      } else {
+        await activateTab(existingTab.tabId)
+      }
+      return
+    }
+
     setErrorMessage(null)
     setIsLoading(true)
     setLoadingProgress('Reading PDF file...')
     recentFilesRef.current?.removeAttribute('open')
 
+    let handedToViewer = false
     try {
-      const result = await window.electronAPI.openRecentPdf(id)
-      loadOpenedPdf(result)
+      const result = await loadDocumentOnce(id)
+      openResultInTab(result, { targetPane })
+      handedToViewer = true
       await refreshRecentFiles()
     } catch (error) {
-      setIsLoading(false)
-      setLoadingProgress(null)
       setErrorMessage(getErrorMessage(error))
       await refreshRecentFiles()
+    } finally {
+      if (!handedToViewer) {
+        setIsLoading(false)
+        setLoadingProgress(null)
+      }
     }
   }
 
-  function loadOpenedPdf(result: OpenedPdf) {
-    const readingState = result.readingState
+  function loadOpenedPdf(result: OpenedPdf, tabState?: PdfTabState) {
+    const readingState = tabState ?? result.readingState
     const restoredZoom = clampScale(readingState.zoom)
     documentLoadStartedRef.current = performance.now()
     initialPageRenderedRef.current = false
@@ -2369,7 +4526,11 @@ function App() {
     window.clearTimeout(zoomDebounceRef.current)
     window.clearTimeout(zoomSnapshotTimeoutRef.current)
     window.clearTimeout(backgroundDocumentTaskRef.current)
+    searchIndexAbortRef.current?.abort()
+    searchIndexAbortRef.current = null
+    setSearchIndexProgress(null)
     pendingRestorePageRef.current = readingState.page
+    pendingRestoreOffsetRef.current = tabState?.pageOffset ?? 0
     zoomAnchorRef.current = null
     pageTextCacheRef.current.clear()
     outlineGenerationRef.current += 1
@@ -2379,12 +4540,20 @@ function App() {
     setDocumentMetadata(null)
     setMetadataLoading(false)
     highlightSaveGenerationRef.current += 1
+    signaturePlacementSaveGenerationRef.current += 1
+    fillSignSaveGenerationRef.current += 1
     setHighlights(result.highlights ?? [])
+    setSignaturePlacements(result.signaturePlacements ?? [])
+    setFillSignFields(result.fillSignFields ?? [])
+    setActiveFillSignTool(null)
+    setSelectedFillSignFieldId(null)
+    setSigningSignature(null)
+    setSelectedSignaturePlacementId(null)
+    setSignPickerOpen(false)
     setPendingHighlightSelection(null)
     setHighlightContextMenu(null)
     setFocusedHighlightId(null)
     setEditingNoteId(null)
-    setSelectedHighlightIds(new Set())
     setExportHighlightsOpen(false)
     firstPageProxyRef.current = null
     pdfDocumentRef.current = null
@@ -2392,7 +4561,20 @@ function App() {
     nearbyPageNumbersRef.current.clear()
     setRenderedPageNumbers(new Set([1]))
     setPdfDocument(null)
-    closeSearch()
+    searchGenerationRef.current += 1
+    pageTextCacheRef.current.clear()
+    pendingSearchMatchIndexRef.current = tabState?.selectedMatchIndex ?? -1
+    setSearchOpen(tabState?.searchOpen ?? false)
+    setSearchQuery(tabState?.searchQuery ?? '')
+    setSearchMatches([])
+    setSelectedMatchIndex(-1)
+    setIsSearching(false)
+    setSearchProgress(null)
+    if (tabState) {
+      setThumbnailSidebarOpen(tabState.sidebarOpen)
+      setSidebarTab(tabState.sidebarTab)
+      setSidebarWidth(tabState.sidebarWidth)
+    }
     setActiveDocumentId(result.id)
     displayZoomRef.current = restoredZoom
     renderZoomRef.current = restoredZoom
@@ -2426,6 +4608,211 @@ function App() {
     }
   }
 
+  async function openHighlightLibrary() {
+    setWorkspaceManagerOpen(false)
+    setReferencesOpen(false)
+    setGlobalSearchOpen(false)
+    setGlobalSearchReturnToDashboard(false)
+    setGlobalDashboardOpen(true)
+    await refreshHighlightLibrary()
+  }
+
+  function openGlobalSearch() {
+    setWorkspaceManagerOpen(false)
+    setReferencesOpen(false)
+    setGlobalSearchReturnToDashboard(globalDashboardOpen)
+    setGlobalDashboardOpen(false)
+    setGlobalSearchOpen(true)
+  }
+
+  function closeGlobalSearch() {
+    setGlobalSearchOpen(false)
+    if (globalSearchReturnToDashboard) setGlobalDashboardOpen(true)
+    setGlobalSearchReturnToDashboard(false)
+  }
+
+  function openReferences() {
+    setGlobalDashboardOpen(false)
+    setGlobalSearchOpen(false)
+    setWorkspaceManagerOpen(false)
+    setMergePdfsOpen(false)
+    setImagesToPdfOpen(false)
+    setSignatureManagerOpen(false)
+    setReferencesOpen(true)
+  }
+
+  async function openGlobalSearchResult(result: GlobalSearchResult, query: string) {
+    setGlobalSearchOpen(false)
+    setGlobalSearchReturnToDashboard(false)
+    setErrorMessage(null)
+    const navigation = { result, query: result.matchText || globalSearchNavigationTerm(query) }
+    const existingTab = tabsRef.current.find((tab) => tab.documentId === result.documentId)
+    if (
+      existingTab?.tabId === rightPaneAssignmentRef.current.tabId &&
+      rightDocument?.id === result.documentId
+    ) {
+      focusPane('right')
+      if (result.highlightId) {
+        rightPaneRef.current?.navigateToHighlight(result.highlightId, result.pageNumber)
+      } else if (result.type === 'pdf-text') {
+        rightPaneRef.current?.navigateToSearchResult(result.pageNumber, navigation.query)
+      } else {
+        rightPaneRef.current?.goToPage(result.pageNumber)
+      }
+      return
+    }
+
+    setPendingGlobalSearchNavigation(navigation)
+    if (existingTab) {
+      await activateTab(existingTab.tabId)
+      return
+    }
+
+    setIsLoading(true)
+    setLoadingProgress(`Opening ${result.documentName}...`)
+    try {
+      const opened = await window.electronAPI.openRecentPdf(result.documentId)
+      openResultInTab(opened)
+      void refreshRecentFiles()
+    } catch (error) {
+      setPendingGlobalSearchNavigation(null)
+      setIsLoading(false)
+      setLoadingProgress(null)
+      setErrorMessage(`Could not open search result: ${getErrorMessage(error)}`)
+    }
+  }
+
+  async function refreshHighlightLibrary() {
+    setHighlightLibraryLoading(true)
+    setHighlightLibraryError(null)
+    try {
+      setHighlightLibrary(await window.electronAPI.getHighlightLibrary())
+    } catch (error) {
+      setHighlightLibraryError(getErrorMessage(error))
+    } finally {
+      setHighlightLibraryLoading(false)
+    }
+  }
+
+  async function openLibraryHighlight(entry: HighlightLibraryEntry) {
+    setHighlightLibraryError(null)
+    setGlobalDashboardOpen(false)
+    const existingTab = tabsRef.current.find((tab) => tab.documentId === entry.documentId)
+    if (existingTab?.tabId === rightPaneAssignmentRef.current.tabId && rightDocument?.id === entry.documentId) {
+      focusPane('right')
+      rightPaneRef.current?.navigateToHighlight(entry.highlightId, entry.pageNumber)
+      return
+    }
+
+    setPendingLibraryNavigation(entry)
+    if (existingTab) {
+      await activateTab(existingTab.tabId)
+      return
+    }
+
+    setIsLoading(true)
+    setLoadingProgress(`Opening ${entry.documentName}...`)
+    try {
+      const result = await window.electronAPI.openHighlightDocument(entry.documentKey)
+      openResultInTab(result)
+      void refreshRecentFiles()
+    } catch (error) {
+      setPendingLibraryNavigation(null)
+      setIsLoading(false)
+      setLoadingProgress(null)
+      const message = `Could not open highlight source: ${getErrorMessage(error)}`
+      try {
+        setHighlightLibrary(await window.electronAPI.getHighlightLibrary())
+      } catch {
+        // Preserve the source-open error; refresh can be retried from the dashboard.
+      }
+      setErrorMessage(message)
+    }
+  }
+
+  function synchronizeLibraryPatch(
+    entries: HighlightLibraryEntry[],
+    patch: Partial<Pick<PdfHighlight, 'note' | 'category' | 'color'>>,
+    library: HighlightLibrary,
+  ) {
+    const targets = new Set(entries.map((entry) => `${entry.documentId}:${entry.highlightId}`))
+    const applyPatch = (documentId: string, source: PdfHighlight[]) =>
+      source.map((highlight) => {
+        if (!targets.has(`${documentId}:${highlight.id}`)) return highlight
+        const indexed = library.entries.find(
+          (entry) => entry.documentId === documentId && entry.highlightId === highlight.id,
+        )
+        return {
+          ...highlight,
+          ...patch,
+          modifiedDate: indexed?.modifiedDate ?? new Date().toISOString(),
+        }
+      })
+    if (pdfFile) setHighlights((current) => applyPatch(pdfFile.id, current))
+    setRightDocument((current) => current
+      ? { ...current, highlights: applyPatch(current.id, current.highlights) }
+      : current)
+  }
+
+  async function updateLibraryHighlights(
+    entries: HighlightLibraryEntry[],
+    patch: Partial<Pick<PdfHighlight, 'note' | 'category' | 'color'>>,
+  ) {
+    if (!entries.length) return
+    try {
+      const library = await window.electronAPI.updateHighlightLibrary(
+        entries.map((entry) => ({
+          documentKey: entry.documentKey,
+          highlightId: entry.highlightId,
+          patch,
+        })),
+      )
+      setHighlightLibrary(library)
+      synchronizeLibraryPatch(entries, patch, library)
+    } catch (error) {
+      setHighlightLibraryError(`Could not update highlights: ${getErrorMessage(error)}`)
+    }
+  }
+
+  async function deleteLibraryHighlights(entries: HighlightLibraryEntry[]) {
+    if (!entries.length) return
+    try {
+      const deletedKeys = new Set(entries.map((entry) => entry.key))
+      const deletedByDocument = new Set(entries.map((entry) => `${entry.documentId}:${entry.highlightId}`))
+      const library = await window.electronAPI.deleteHighlightLibraryEntries([...deletedKeys])
+      setHighlightLibrary(library)
+      if (pdfFile) {
+        setHighlights((current) => current.filter(
+          (highlight) => !deletedByDocument.has(`${pdfFile.id}:${highlight.id}`),
+        ))
+      }
+      setRightDocument((current) => current
+        ? {
+            ...current,
+            highlights: current.highlights.filter(
+              (highlight) => !deletedByDocument.has(`${current.id}:${highlight.id}`),
+            ),
+          }
+        : current)
+    } catch (error) {
+      setHighlightLibraryError(`Could not delete highlights: ${getErrorMessage(error)}`)
+    }
+  }
+
+  async function exportLibraryHighlights(
+    entries: HighlightLibraryEntry[],
+    format: 'markdown' | 'text' | 'docx',
+  ) {
+    try {
+      await window.electronAPI.exportHighlightLibrary({
+        format,
+        keys: entries.map((entry) => entry.key),
+      })
+    } catch (error) {
+      setHighlightLibraryError(`Could not export highlights: ${getErrorMessage(error)}`)
+    }
+  }
+
   return (
     <main className="min-h-screen bg-[#0f172a] text-slate-100">
       {dragActive ? (
@@ -2435,50 +4822,23 @@ function App() {
               <DropPdfIcon />
             </span>
             <div>
-              <p className="text-xl font-semibold text-white">Drop PDF to open</p>
-              <p className="mt-1 text-sm text-slate-400">The first PDF in the drop will be opened.</p>
+              <p className="text-xl font-semibold text-white">
+                Drop PDF into {dropTargetPane ? `${dropTargetPane === 'left' ? 'Left' : 'Right'} Pane` : `${activePane === 'left' ? 'Left' : 'Right'} Pane`}
+              </p>
+              <p className="mt-1 text-sm text-slate-400">The first PDF in the drop will open only in that pane.</p>
             </div>
           </div>
         </div>
       ) : null}
 
       {pendingHighlightSelection ? (
-        <div
-          data-highlight-toolbar=""
-          role="toolbar"
-          aria-label="Text highlight colors"
-          onPointerDown={(event) => event.preventDefault()}
-          className="fixed z-50 flex h-11 items-center gap-1 rounded-xl border border-slate-600 bg-slate-900/95 p-1.5 shadow-2xl shadow-black/50 backdrop-blur"
-          style={{
-            left: pendingHighlightSelection.toolbarX,
-            top: pendingHighlightSelection.toolbarY,
-            transform: 'translateX(-50%)',
-          }}
-        >
-          {HIGHLIGHT_COLOR_ORDER.map((color) => (
-            <button
-              key={color}
-              type="button"
-              aria-label={`Highlight ${HIGHLIGHT_COLOR_LABELS[color]}`}
-              title={`Highlight ${HIGHLIGHT_COLOR_LABELS[color]}`}
-              onClick={() => addHighlight(pendingHighlightSelection, color)}
-              className="grid size-8 place-items-center rounded-lg hover:bg-slate-700"
-            >
-              <span
-                className={`size-5 rounded-full border-2 ${highlightColorSwatchClass(color)}`}
-              />
-            </button>
-          ))}
-          <span aria-hidden="true" className="mx-1 h-6 w-px bg-slate-600" />
-          <button
-            type="button"
-            title="Remove overlapping highlights"
-            onClick={() => removeSelectedHighlights(pendingHighlightSelection)}
-            className="h-8 rounded-lg px-2 text-xs font-medium text-red-200 hover:bg-red-500/20"
-          >
-            Remove
-          </button>
-        </div>
+        <HighlightSelectionToolbar
+          x={pendingHighlightSelection.toolbarX}
+          y={pendingHighlightSelection.toolbarY}
+          onHighlight={(color) => addHighlight(pendingHighlightSelection, color)}
+          onRemove={() => removeSelectedHighlights(pendingHighlightSelection)}
+          onClose={clearHighlightSelection}
+        />
       ) : null}
 
       {highlightContextMenu ? (
@@ -2511,7 +4871,7 @@ function App() {
             </span>
             <select
               value={
-                highlights.find((highlight) => highlight.id === highlightContextMenu.highlightId)
+                sidebarHighlights.find((highlight) => highlight.id === highlightContextMenu.highlightId)
                   ?.category ?? 'important'
               }
               onChange={(event) =>
@@ -2535,7 +4895,7 @@ function App() {
             onClick={() => startEditingNote(highlightContextMenu.highlightId)}
             className="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
           >
-            {highlights.find((highlight) => highlight.id === highlightContextMenu.highlightId)?.note
+            {sidebarHighlights.find((highlight) => highlight.id === highlightContextMenu.highlightId)?.note
               ? 'Edit Note'
               : 'Add Note'}
           </button>
@@ -2563,6 +4923,39 @@ function App() {
           >
             Delete Highlight
           </button>
+        </div>
+      ) : null}
+
+      {tabContextMenu ? (
+        <div
+          role="menu"
+          aria-label="Tab actions"
+          className="fixed z-[70] w-52 rounded-xl border border-slate-600 bg-slate-900 p-1.5 shadow-2xl shadow-black/60"
+          style={{
+            left: Math.min(tabContextMenu.x, window.innerWidth - 220),
+            top: Math.min(tabContextMenu.y, window.innerHeight - 240),
+          }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <TabMenuButton onClick={() => void closeTab(tabContextMenu.tabId)}>Close</TabMenuButton>
+          <TabMenuButton onClick={() => closeOtherTabs(tabContextMenu.tabId)}>Close Others</TabMenuButton>
+          <TabMenuButton onClick={() => closeTabsToRight(tabContextMenu.tabId)}>Close Tabs to Right</TabMenuButton>
+          <div className="my-1 border-t border-slate-700" />
+          <TabMenuButton onClick={() => {
+            void openTabInRightPane(tabContextMenu.tabId)
+            setTabContextMenu(null)
+          }}>Open in Split View</TabMenuButton>
+          <TabMenuButton onClick={() => {
+            moveTabToLeftPane(tabContextMenu.tabId)
+            setTabContextMenu(null)
+          }}>Move to Left Pane</TabMenuButton>
+          <TabMenuButton onClick={() => {
+            void openTabInRightPane(tabContextMenu.tabId)
+            setTabContextMenu(null)
+          }}>Move to Right Pane</TabMenuButton>
+          <div className="my-1 border-t border-slate-700" />
+          <TabMenuButton onClick={() => void revealTabFile(tabContextMenu.tabId)}>Reveal File</TabMenuButton>
+          <TabMenuButton onClick={() => void duplicateTab(tabContextMenu.tabId)}>Duplicate Tab</TabMenuButton>
         </div>
       ) : null}
 
@@ -2610,7 +5003,7 @@ function App() {
               <legend className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Export Scope</legend>
               <div className="grid gap-2 sm:grid-cols-3">
                 {([
-                  ['all', `All (${highlights.length})`],
+                  ['all', `All (${sidebarHighlights.length})`],
                   ['category', 'Current Category'],
                   ['selected', `Selected (${selectedHighlightIds.size})`],
                 ] as const).map(([scope, label]) => (
@@ -2668,7 +5061,7 @@ function App() {
               <button
                 type="button"
                 onClick={() => void exportHighlightCollection()}
-                disabled={isExportingHighlights || highlights.length === 0}
+                disabled={isExportingHighlights || sidebarHighlights.length === 0}
                 className="rounded-lg bg-blue-500 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-400 disabled:opacity-40"
               >
                 {isExportingHighlights ? 'Exporting...' : 'Choose Save Location'}
@@ -2714,12 +5107,325 @@ function App() {
             </div>
           </details>
 
+          <div ref={pdfToolsMenuRef} className="relative">
+            <button
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={pdfToolsMenuOpen}
+              onClick={() => setPdfToolsMenuOpen((isOpen) => !isOpen)}
+              className={`flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition-colors duration-150 ${mergePdfsOpen || imagesToPdfOpen || signatureManagerOpen || pdfToolsMenuOpen ? 'border-blue-400 bg-blue-500/15 text-blue-200' : 'border-slate-700 text-slate-300 hover:bg-slate-800'}`}
+            >
+              <PdfToolsIcon />
+              PDF Tools
+              <ChevronDownIcon open={pdfToolsMenuOpen} />
+            </button>
+            {pdfToolsMenuOpen ? (
+              <div role="menu" className="absolute left-0 top-12 z-20 w-60 rounded-xl border border-slate-700 bg-slate-900 p-2 shadow-2xl shadow-black/40">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setWorkspaceManagerOpen(false)
+                    setReferencesOpen(false)
+                    setGlobalDashboardOpen(false)
+                    setGlobalSearchOpen(false)
+                    setImagesToPdfOpen(false)
+                    setSignatureManagerOpen(false)
+                    setMergePdfsOpen(true)
+                    setPdfToolsMenuOpen(false)
+                  }}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold text-slate-200 transition-colors duration-150 hover:bg-slate-800"
+                >
+                  <MergePdfIcon />
+                  <span>Merge PDFs</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setWorkspaceManagerOpen(false)
+                    setReferencesOpen(false)
+                    setGlobalDashboardOpen(false)
+                    setGlobalSearchOpen(false)
+                    setMergePdfsOpen(false)
+                    setSignatureManagerOpen(false)
+                    setImagesToPdfOpen(true)
+                    setPdfToolsMenuOpen(false)
+                  }}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold text-slate-200 transition-colors duration-150 hover:bg-slate-800"
+                >
+                  <ImagesToPdfIcon />
+                  <span>Images to PDF</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setWorkspaceManagerOpen(false)
+                    setReferencesOpen(false)
+                    setGlobalDashboardOpen(false)
+                    setGlobalSearchOpen(false)
+                    setMergePdfsOpen(false)
+                    setImagesToPdfOpen(false)
+                    setSignatureManagerOpen(true)
+                    setPdfToolsMenuOpen(false)
+                  }}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold text-slate-200 transition-colors duration-150 hover:bg-slate-800"
+                >
+                  <SignatureToolIcon />
+                  <span>Signature Manager</span>
+                </button>
+              </div>
+            ) : null}
+          </div>
+
+          <div ref={signPickerRef} data-signature-picker="" className="relative">
+            <button
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={signPickerOpen}
+              title="Place saved signature"
+              disabled={!(splitEnabled && activePane === 'right' ? rightDocument : pdfFile)}
+              onClick={() => {
+                setActiveFillSignTool(null)
+                setSelectedFillSignFieldId(null)
+                setSignPickerOpen((isOpen) => !isOpen)
+                void refreshSavedSignatures()
+              }}
+              className={`flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${
+                signingSignature || signPickerOpen
+                  ? 'border-blue-400 bg-blue-500/15 text-blue-200'
+                  : 'border-slate-700 text-slate-300 hover:bg-slate-800'
+              }`}
+            >
+              <SignatureToolIcon />
+              Sign
+            </button>
+            {signPickerOpen ? (
+              <div role="menu" className="absolute left-0 top-12 z-30 w-72 rounded-xl border border-slate-700 bg-slate-900 p-2 shadow-2xl shadow-black/45">
+                <div className="flex items-start justify-between gap-2 px-2 py-1.5">
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Choose Signature</p>
+                    <p className="mt-1 text-[11px] text-slate-500">Stored locally on this device.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSignatureManagerOpen(true)
+                      setSignPickerOpen(false)
+                    }}
+                    className="rounded-md border border-slate-700 px-2 py-1 text-[11px] font-semibold text-slate-300 hover:bg-slate-800"
+                  >
+                    Manage
+                  </button>
+                </div>
+                {signaturesLoading ? (
+                  <p className="px-3 py-4 text-sm text-slate-400">Loading signatures...</p>
+                ) : savedSignatures.length ? (
+                  <div className="max-h-72 space-y-1 overflow-auto">
+                    {savedSignatures.map((signature) => (
+                      <button
+                        key={signature.id}
+                        type="button"
+                        role="menuitem"
+                        onClick={() => chooseSignatureForPlacement(signature)}
+                        className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left text-sm text-slate-200 transition-colors duration-150 hover:bg-slate-800"
+                      >
+                        <span className="grid h-10 w-20 shrink-0 place-items-center rounded border border-slate-700 bg-white p-1">
+                          <img src={signature.imageDataUrl} alt="" draggable={false} className="max-h-full max-w-full object-contain" />
+                        </span>
+                        <span className="min-w-0">
+                          <span className="block truncate font-semibold">{signature.name}</span>
+                          <span className="text-[10px] uppercase text-slate-500">{signature.type}{signature.isDefault ? ' | Default' : ''}</span>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="px-3 py-4 text-sm text-slate-400">
+                    <p>No saved signatures.</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSignatureManagerOpen(true)
+                        setSignPickerOpen(false)
+                      }}
+                      className="mt-3 rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-800"
+                    >
+                      Open Signature Manager
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+
+          <div data-fill-sign-tools="" className="flex h-10 items-center gap-1 rounded-lg border border-slate-700 bg-slate-900/60 px-1">
+            <button
+              type="button"
+              onClick={() => activateFillSignTool('text')}
+              disabled={!activeSignatureDocument}
+              title="Add text"
+              className={fillSignToolButtonClass(activeFillSignTool === 'text')}
+            >
+              T
+            </button>
+            <button
+              type="button"
+              onClick={() => activateFillSignTool('date')}
+              disabled={!activeSignatureDocument}
+              title="Add date"
+              className={fillSignToolButtonClass(activeFillSignTool === 'date')}
+            >
+              <CalendarIcon />
+            </button>
+            <button
+              type="button"
+              onClick={() => activateFillSignTool('initials')}
+              disabled={!activeSignatureDocument}
+              title="Add initials"
+              className={fillSignToolButtonClass(activeFillSignTool === 'initials')}
+            >
+              In
+            </button>
+            <button
+              type="button"
+              onClick={() => activateFillSignTool('checkbox')}
+              disabled={!activeSignatureDocument}
+              title="Add checkbox"
+              className={fillSignToolButtonClass(activeFillSignTool === 'checkbox')}
+            >
+              <CheckBoxIcon />
+            </button>
+            <div ref={fillSignDateMenuRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setFillSignDateMenuOpen((isOpen) => !isOpen)}
+                disabled={!activeSignatureDocument}
+                title={`Date format: ${fillSignDateFormat}`}
+                aria-label={`Date format: ${fillSignDateFormat}`}
+                className={`grid h-8 min-w-8 place-items-center rounded-md px-2 text-xs font-bold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${
+                  fillSignDateMenuOpen
+                    ? 'bg-cyan-500/20 text-cyan-100 ring-1 ring-cyan-400/70'
+                    : 'text-slate-300 hover:bg-slate-800'
+                }`}
+              >
+                <DateFormatIcon />
+              </button>
+              {fillSignDateMenuOpen ? (
+                <div className="absolute right-0 top-10 z-30 w-44 rounded-xl border border-slate-700 bg-slate-900 p-1.5 shadow-2xl shadow-black/40">
+                  {(['DD/MM/YYYY', 'MM/DD/YYYY', 'YYYY-MM-DD'] as FillSignDateFormat[]).map((format) => (
+                    <button
+                      key={format}
+                      type="button"
+                      onClick={() => {
+                        setFillSignDateFormat(format)
+                        setFillSignDateMenuOpen(false)
+                      }}
+                      className={`block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold transition-colors duration-150 ${
+                        fillSignDateFormat === format
+                          ? 'bg-cyan-500/15 text-cyan-100'
+                          : 'text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      {format}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void saveSignedCopy()}
+            disabled={!activeSignatureDocument || (activeSignaturePlacements.length === 0 && activeFillSignFields.length === 0) || isSavingSignedCopy}
+            title={
+              activeSignaturePlacements.length === 0 && activeFillSignFields.length === 0
+                ? 'Place a signature or Fill & Sign field before saving'
+                : 'Save signed PDF copy'
+            }
+            className="flex h-10 items-center gap-2 rounded-lg border border-slate-700 px-3 text-sm font-semibold text-slate-300 transition-colors duration-150 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <SignedCopyIcon />
+            {isSavingSignedCopy ? 'Saving...' : 'Save Signed Copy'}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void openWorkspaceManager()}
+            className={`flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold ${
+              workspaceManagerOpen
+                ? 'border-blue-400 bg-blue-500/15 text-blue-200'
+                : 'border-slate-700 text-slate-300 hover:bg-slate-800'
+            }`}
+            title="Open workspace manager"
+          >
+            <WorkspaceIcon />
+            <span className="max-w-40 truncate">{workspaceList.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? 'Workspaces'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={openReferences}
+            className={`flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold ${referencesOpen ? 'border-cyan-400 bg-cyan-500/15 text-cyan-200' : 'border-slate-700 text-slate-300 hover:bg-slate-800'}`}
+            title="Open citation and reference manager"
+          >
+            <ReferencesIcon />
+            References
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setWorkspaceManagerOpen(false)
+              setReferencesOpen(false)
+              setMergePdfsOpen(false)
+              setImagesToPdfOpen(false)
+              setSignatureManagerOpen(false)
+              if (globalDashboardOpen) setGlobalDashboardOpen(false)
+              else void openHighlightLibrary()
+            }}
+            className={`flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold ${
+              globalDashboardOpen
+                ? 'border-blue-400 bg-blue-500/15 text-blue-200'
+                : 'border-slate-700 text-slate-300 hover:bg-slate-800'
+            }`}
+            title="Open the global highlights knowledge base"
+          >
+            <HighlightsIcon />
+            Knowledge Base
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setWorkspaceManagerOpen(false)
+              setReferencesOpen(false)
+              setGlobalDashboardOpen(false)
+              setMergePdfsOpen(false)
+              setImagesToPdfOpen(false)
+              setSignatureManagerOpen(false)
+              setGlobalSearchReturnToDashboard(false)
+              setGlobalSearchOpen((open) => !open)
+            }}
+            className={`grid size-10 place-items-center rounded-lg border ${
+              globalSearchOpen
+                ? 'border-blue-400 bg-blue-500/15 text-blue-200'
+                : 'border-slate-700 text-slate-300 hover:bg-slate-800'
+            }`}
+            aria-label="Search all PDFs"
+            title="Search all PDFs (Ctrl+Shift+F)"
+          >
+            <GlobalSearchIcon />
+          </button>
+
           <button
             type="button"
             aria-label="Print PDF"
-            title="Print PDF (Ctrl+P)"
+            title={`Print ${splitEnabled ? `${activePane === 'right' ? 'Right' : 'Left'} Pane` : 'PDF'} (Ctrl+P)`}
             onClick={() => void printCurrentPdf()}
-            disabled={!activeDocumentId || isPrinting}
+            disabled={!(splitEnabled && activePane === 'right' ? rightDocument?.id : activeDocumentId) || isPrinting}
             className="grid size-10 place-items-center rounded-lg border border-slate-700 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <PrintIcon />
@@ -2729,10 +5435,10 @@ function App() {
             <button
               type="button"
               aria-label="Export current page"
-              title="Export current page"
+              title={`Export current page from ${splitEnabled ? `${activePane === 'right' ? 'Right' : 'Left'} Pane` : 'PDF'}`}
               aria-expanded={exportMenuOpen}
               onClick={() => setExportMenuOpen((isOpen) => !isOpen)}
-              disabled={!pdfDocument || isExporting}
+              disabled={!(splitEnabled && activePane === 'right' ? rightDocument : pdfDocument) || isExporting}
               className={`grid size-10 place-items-center rounded-lg border disabled:cursor-not-allowed disabled:opacity-40 ${
                 exportMenuOpen
                   ? 'border-blue-400 bg-blue-500/15 text-blue-200'
@@ -2753,6 +5459,15 @@ function App() {
                 </button>
                 <button
                   type="button"
+                  onClick={openReferences}
+                  className={`group/sidebar-tab relative mb-1 flex w-full items-center justify-center rounded-xl border border-transparent font-semibold text-slate-400 transition-all duration-200 hover:border-cyan-400/50 hover:bg-cyan-500/15 hover:text-cyan-100 ${thumbnailSidebarOpen ? 'gap-2 px-3 py-2.5 text-xs' : 'size-10'}`}
+                  title="References"
+                >
+                  <ReferencesIcon />
+                  {thumbnailSidebarOpen ? <span>References</span> : <span className="sr-only">References</span>}
+                </button>
+                <button
+                  type="button"
                   onClick={() => void exportCurrentPage('jpeg')}
                   className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
                 >
@@ -2764,12 +5479,53 @@ function App() {
 
           <ToolbarDivider />
 
+          <div className="relative">
+            <button
+              type="button"
+              aria-label="Split view"
+              title="Split View (Ctrl+\\)"
+              aria-expanded={splitMenuOpen}
+              onClick={() => setSplitMenuOpen((open) => !open)}
+              disabled={!pdfFile}
+              className={`grid size-10 place-items-center rounded-lg border disabled:cursor-not-allowed disabled:opacity-40 ${
+                splitEnabled
+                  ? 'border-blue-400 bg-blue-500/15 text-blue-200'
+                  : 'border-slate-700 hover:bg-slate-800'
+              }`}
+            >
+              <SplitViewIcon />
+            </button>
+            {splitMenuOpen ? (
+              <div className="absolute right-0 top-12 z-40 w-56 rounded-xl border border-slate-700 bg-slate-900 p-2 shadow-2xl shadow-black/50">
+                <TabMenuButton onClick={() => void splitCurrentTab()}>Split Current Tab</TabMenuButton>
+                <TabMenuButton onClick={() => {
+                  const tabId = activePane === 'right' ? rightTabId : leftTabId
+                  if (tabId) void openTabInRightPane(tabId)
+                  setSplitMenuOpen(false)
+                }}>Open Tab In Right Pane</TabMenuButton>
+                <TabMenuButton onClick={() => {
+                  const tabId = activePane === 'right' ? rightTabId : leftTabId
+                  if (tabId) openTabInLeftPane(tabId)
+                }}>Open Tab In Left Pane</TabMenuButton>
+                <div className="my-1 border-t border-slate-700" />
+                <TabMenuButton onClick={closeSplitView}>Close Split View</TabMenuButton>
+              </div>
+            ) : null}
+          </div>
+
+          {splitEnabled ? (
+            <span className="flex h-10 items-center rounded-lg border border-blue-400/40 bg-blue-500/10 px-3 text-xs font-semibold text-blue-200">
+              Target: {activePane === 'right' ? 'Right Pane' : 'Left Pane'}
+            </span>
+          ) : null}
+
+          {!splitEnabled ? <>
           <button
             type="button"
             aria-label="Previous page"
             title="Previous page (PageUp)"
-            onClick={() => goToPage(currentPageRef.current - 1)}
-            disabled={numPages === 0 || currentPage === 1}
+            onClick={() => goToActivePage('previous')}
+            disabled={splitEnabled && activePane === 'right' ? (rightPaneState?.page ?? 1) === 1 : numPages === 0 || currentPage === 1}
             className="grid size-10 place-items-center rounded-lg border border-slate-700 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <PreviousPageIcon />
@@ -2782,8 +5538,8 @@ function App() {
               type="number"
               min="1"
               max={Math.max(1, numPages)}
-              value={pageInput}
-              disabled={numPages === 0}
+              value={splitEnabled && activePane === 'right' ? String(rightPaneState?.page ?? 1) : pageInput}
+              disabled={numPages === 0 || (splitEnabled && activePane === 'right')}
               onFocus={() => {
                 pageInputFocusedRef.current = true
               }}
@@ -2799,15 +5555,15 @@ function App() {
               }}
               className="w-12 rounded border border-slate-600 bg-slate-950 px-1.5 py-1 text-center text-slate-100 outline-none focus:border-blue-400 disabled:opacity-40"
             />
-            <span className="whitespace-nowrap text-xs text-slate-400">of {numPages || 0}</span>
+            <span className="whitespace-nowrap text-xs text-slate-400">of {splitEnabled && activePane === 'right' ? '—' : numPages || 0}</span>
           </label>
 
           <button
             type="button"
             aria-label="Next page"
             title="Next page (PageDown)"
-            onClick={() => goToPage(currentPageRef.current + 1)}
-            disabled={numPages === 0 || currentPage === numPages}
+            onClick={() => goToActivePage('next')}
+            disabled={splitEnabled && activePane === 'right' ? false : numPages === 0 || currentPage === numPages}
             className="grid size-10 place-items-center rounded-lg border border-slate-700 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <NextPageIcon />
@@ -2819,23 +5575,23 @@ function App() {
             type="button"
             aria-label="Zoom out"
             title="Zoom out"
-            onClick={() => changeZoom(displayZoomRef.current - 0.25)}
-            disabled={displayZoom <= MIN_SCALE}
+            onClick={() => changeActiveZoom(-0.25)}
+            disabled={(splitEnabled && activePane === 'right' ? rightPaneState?.zoom ?? 1 : displayZoom) <= MIN_SCALE}
             className="grid size-10 place-items-center rounded-lg border border-slate-700 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <ZoomOutIcon />
           </button>
 
           <span className="flex h-10 min-w-16 items-center justify-center text-center text-sm">
-            {Math.round(displayZoom * 100)}%
+            {Math.round((splitEnabled && activePane === 'right' ? rightPaneState?.zoom ?? 1 : displayZoom) * 100)}%
           </span>
 
           <button
             type="button"
             aria-label="Zoom in"
             title="Zoom in"
-            onClick={() => changeZoom(displayZoomRef.current + 0.25)}
-            disabled={displayZoom >= MAX_SCALE}
+            onClick={() => changeActiveZoom(0.25)}
+            disabled={(splitEnabled && activePane === 'right' ? rightPaneState?.zoom ?? 1 : displayZoom) >= MAX_SCALE}
             className="grid size-10 place-items-center rounded-lg border border-slate-700 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <ZoomInIcon />
@@ -2847,10 +5603,10 @@ function App() {
             type="button"
             aria-label="Fit width"
             title="Fit width"
-            onClick={fitWidth}
+            onClick={fitActivePane}
             disabled={!pdfFile}
             className={`grid size-10 place-items-center rounded-lg border disabled:cursor-not-allowed disabled:opacity-40 ${
-              zoomMode === 'fit-width'
+              (splitEnabled && activePane === 'right' ? rightPaneState?.fitMode : zoomMode === 'fit-width')
                 ? 'border-blue-400 bg-blue-500/15 text-blue-200'
                 : 'border-slate-700 hover:bg-slate-800'
             }`}
@@ -2872,6 +5628,7 @@ function App() {
           >
             {viewMode === 'continuous' ? <SinglePageIcon /> : <ContinuousScrollIcon />}
           </button>
+          </> : null}
 
           <ToolbarDivider />
 
@@ -2893,13 +5650,14 @@ function App() {
             </select>
           </label>
 
+          {!splitEnabled ? <>
           <ToolbarDivider />
 
           <button
             type="button"
             aria-label="Rotate left"
             title="Rotate left"
-            onClick={() => rotatePages(-90)}
+            onClick={() => rotateActivePane(-90)}
             disabled={!pdfDocument}
             className="grid size-10 place-items-center rounded-lg border border-slate-700 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
@@ -2910,7 +5668,7 @@ function App() {
             type="button"
             aria-label="Rotate right"
             title="Rotate right"
-            onClick={() => rotatePages(90)}
+            onClick={() => rotateActivePane(90)}
             disabled={!pdfDocument}
             className="grid size-10 place-items-center rounded-lg border border-slate-700 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
@@ -2923,13 +5681,10 @@ function App() {
             type="button"
             aria-label="Search PDF"
             title="Search PDF (Ctrl+F)"
-            onClick={() => {
-              setSearchOpen(true)
-              window.requestAnimationFrame(() => searchInputRef.current?.focus())
-            }}
+            onClick={openActivePaneSearch}
             disabled={!pdfDocument}
             className={`grid size-10 place-items-center rounded-lg border disabled:cursor-not-allowed disabled:opacity-40 ${
-              searchOpen
+              (splitEnabled && activePane === 'right' ? rightPaneState?.searchOpen : searchOpen)
                 ? 'border-blue-400 bg-blue-500/15 text-blue-200'
                 : 'border-slate-700 hover:bg-slate-800'
             }`}
@@ -2938,8 +5693,9 @@ function App() {
           </button>
 
           <ToolbarDivider />
+          </> : null}
 
-          <button
+          {!splitEnabled ? <button
             type="button"
             aria-label="Toggle sidebar"
             title={thumbnailSidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
@@ -2952,7 +5708,7 @@ function App() {
             }`}
           >
             <ThumbnailsIcon />
-          </button>
+          </button> : null}
 
           <button
             type="button"
@@ -2984,21 +5740,125 @@ function App() {
           </button>
 
           <div className="ml-auto flex h-10 min-w-0 max-w-80 items-center gap-2 rounded-lg border border-transparent px-2 text-xs text-slate-400 transition-colors duration-200 hover:border-slate-700 hover:bg-slate-800/60">
-            {pdfFile ? (
+            {(splitEnabled && activePane === 'right' ? rightDocument : pdfFile) ? (
               <>
                 <FileIcon />
-                <span title={pdfFile.name} className="min-w-0 truncate font-medium text-slate-200">
-                  {pdfFile.name}
+                <span title={splitEnabled && activePane === 'right' ? rightDocument?.name : pdfFile?.name} className="min-w-0 truncate font-medium text-slate-200">
+                  {splitEnabled && activePane === 'right' ? rightDocument?.name : pdfFile?.name}
                 </span>
                 <span aria-hidden="true" className="text-slate-600">•</span>
                 <span className="shrink-0">
-                  {numPages > 0 ? `${numPages} pages` : isLoading ? 'Loading...' : ''}
+                  {splitEnabled && activePane === 'right'
+                    ? rightViewStatus.totalPages > 0 ? `${rightViewStatus.totalPages} pages` : isLoading ? 'Loading...' : ''
+                    : numPages > 0 ? `${numPages} pages` : isLoading ? 'Loading...' : ''}
                 </span>
               </>
             ) : (
               'No PDF selected'
             )}
           </div>
+        </div>
+
+        <div className="mt-2 flex min-w-0 items-end border-t border-slate-700/70 pt-2">
+          <div
+            role="tablist"
+            aria-label="Open PDF documents"
+            className="flex min-w-0 flex-1 items-end gap-1 overflow-x-auto [scrollbar-width:thin]"
+          >
+            {tabs.map((tab) => {
+              const assignedLeft = tab.tabId === leftTabId
+              const assignedRight = splitEnabled && tab.tabId === rightTabId
+              const active = activePane === 'right' ? assignedRight : assignedLeft
+              return (
+                <div
+                  key={tab.tabId}
+                  role="tab"
+                  aria-selected={active}
+                  draggable
+                  onDragStart={(event) => {
+                    draggedTabIdRef.current = tab.tabId
+                    setDraggedTabId(tab.tabId)
+                    event.dataTransfer.effectAllowed = 'move'
+                    event.dataTransfer.setData('application/x-next-pdf-tab', tab.tabId)
+                  }}
+                  onDragEnd={() => {
+                    draggedTabIdRef.current = null
+                    setDraggedTabId(null)
+                    setTabDropTargetId(null)
+                  }}
+                  onDragEnter={() => {
+                    if (draggedTabIdRef.current && draggedTabIdRef.current !== tab.tabId) {
+                      setTabDropTargetId(tab.tabId)
+                    }
+                  }}
+                  onDragOver={(event) => {
+                    if (draggedTabIdRef.current) {
+                      event.preventDefault()
+                      event.dataTransfer.dropEffect = 'move'
+                    }
+                  }}
+                  onDrop={(event) => {
+                    const draggedTabId = event.dataTransfer.getData('application/x-next-pdf-tab')
+                    if (draggedTabId) {
+                      event.preventDefault()
+                      reorderTab(draggedTabId, tab.tabId)
+                      setDraggedTabId(null)
+                      setTabDropTargetId(null)
+                    }
+                  }}
+                  onAuxClick={(event) => {
+                    if (event.button === 1) {
+                      event.preventDefault()
+                      void closeTab(tab.tabId)
+                    }
+                  }}
+                  onContextMenu={(event) => {
+                    event.preventDefault()
+                    setTabContextMenu({ tabId: tab.tabId, x: event.clientX, y: event.clientY })
+                  }}
+                  className={`group relative flex h-9 min-w-36 max-w-60 shrink-0 items-center overflow-hidden rounded-t-lg border border-b-0 transition-all duration-150 ${
+                    draggedTabId === tab.tabId ? 'scale-[0.98] opacity-55' : ''
+                  } ${
+                    tabDropTargetId === tab.tabId ? 'ring-1 ring-inset ring-blue-400/80' : ''
+                  } ${
+                    active
+                      ? 'border-slate-600 bg-slate-800 text-slate-50 shadow-[inset_0_2px_0_#3b82f6]'
+                      : 'border-transparent bg-slate-900/45 text-slate-400 hover:bg-slate-800/70 hover:text-slate-200'
+                  }`}
+                >
+                  <button
+                    type="button"
+                    title={tab.name}
+                    onClick={() => activateTabForPane(tab.tabId)}
+                    className="flex h-full min-w-0 flex-1 items-center gap-2 px-3 text-left text-xs font-medium"
+                  >
+                    <FileIcon />
+                    <span className="truncate">{tab.name}</span>
+                    {assignedLeft ? <span className="rounded bg-slate-700 px-1 text-[9px] text-slate-300">L</span> : null}
+                    {assignedRight ? <span className="rounded bg-blue-500/25 px-1 text-[9px] text-blue-200">R</span> : null}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Close ${tab.name}`}
+                    title={`Close ${tab.name}`}
+                    onClick={() => void closeTab(tab.tabId)}
+                    className="mr-1 grid size-7 shrink-0 place-items-center rounded-md text-base text-slate-500 opacity-60 transition hover:bg-slate-700 hover:text-white group-hover:opacity-100"
+                  >
+                    &times;
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+          <button
+            type="button"
+            aria-label="Open PDF in new tab"
+            title="Open PDF in new tab (Ctrl+O)"
+            onClick={() => void openPdf()}
+            className="ml-1 grid size-9 shrink-0 place-items-center rounded-lg text-xl text-slate-400 transition-colors duration-150 hover:bg-slate-800 hover:text-white"
+          >
+            +
+          </button>
         </div>
 
         {shortcutHelpOpen ? (
@@ -3041,6 +5901,9 @@ function App() {
                 onChange={(event) => {
                   const query = event.target.value
                   setSearchQuery(query)
+                  if (splitEnabled && searchBothPanes) {
+                    rightPaneRef.current?.search(query)
+                  }
                   setSearchMatches([])
                   setSelectedMatchIndex(-1)
                   setIsSearching(query.trim().length > 0)
@@ -3058,6 +5921,24 @@ function App() {
               />
             </label>
 
+            {splitEnabled ? (
+              <label className="flex h-9 items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-2 text-xs text-slate-300">
+                <span>Search</span>
+                <select
+                  value={searchBothPanes ? 'both' : 'current'}
+                  onChange={(event) => {
+                    const searchBoth = event.target.value === 'both'
+                    setSearchBothPanes(searchBoth)
+                    if (searchBoth) rightPaneRef.current?.search(searchQuery)
+                  }}
+                  className="rounded bg-slate-950 px-2 py-1 outline-none"
+                >
+                  <option value="current">Left Pane</option>
+                  <option value="both">Both Panes</option>
+                </select>
+              </label>
+            ) : null}
+
             <span className="min-w-24 text-center text-sm text-slate-300" aria-live="polite">
               {isSearching
                 ? searchProgress
@@ -3069,6 +5950,11 @@ function App() {
                     ? `Match ${selectedMatchIndex + 1} of ${searchMatches.length}`
                     : ''}
             </span>
+            {splitEnabled && searchBothPanes ? (
+              <span className="rounded-lg bg-slate-900 px-2 py-2 text-xs text-slate-400">
+                Right Pane: {rightSearchStatus.total > 0 ? `Match ${rightSearchStatus.current} of ${rightSearchStatus.total}` : rightSearchStatus.query ? 'No results' : 'Ready'}
+              </span>
+            ) : null}
 
             <div className="flex h-10 items-center gap-1 rounded-lg border border-slate-700 px-2">
               <span className="mr-1 text-xs text-slate-400">Highlight</span>
@@ -3122,6 +6008,22 @@ function App() {
             {errorMessage}
           </div>
         ) : null}
+        {signingSignature ? (
+          <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-amber-400/40 bg-amber-950/35 px-4 py-3 text-sm font-semibold text-amber-100 shadow-lg shadow-amber-950/15">
+            <span>Click anywhere on the PDF to place your signature</span>
+            <button type="button" onClick={() => setSigningSignature(null)} className="rounded-lg border border-amber-300/40 px-3 py-1 text-xs hover:bg-amber-500/15">
+              Cancel
+            </button>
+          </div>
+        ) : null}
+        {activeFillSignTool ? (
+          <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-cyan-400/40 bg-cyan-950/35 px-4 py-3 text-sm font-semibold text-cyan-100 shadow-lg shadow-cyan-950/15">
+            <span>Click anywhere on the PDF to place {fillSignToolLabel(activeFillSignTool)}</span>
+            <button type="button" onClick={() => setActiveFillSignTool(null)} className="rounded-lg border border-cyan-300/40 px-3 py-1 text-xs hover:bg-cyan-500/15">
+              Cancel
+            </button>
+          </div>
+        ) : null}
         {loadingProgress ? (
           <div
             role="status"
@@ -3139,7 +6041,93 @@ function App() {
           </div>
         ) : null}
 
-        <div className="flex items-start gap-3">
+        {globalDashboardOpen ? (
+          <GlobalHighlightsDashboard
+            library={highlightLibrary}
+            loading={highlightLibraryLoading}
+            error={highlightLibraryError}
+            onClose={() => setGlobalDashboardOpen(false)}
+            onOpenSearch={openGlobalSearch}
+            onRefresh={() => void refreshHighlightLibrary()}
+            onOpen={(entry) => void openLibraryHighlight(entry)}
+            onUpdate={updateLibraryHighlights}
+            onDelete={deleteLibraryHighlights}
+            onExport={exportLibraryHighlights}
+            onFilteredCountChange={handleLibraryFilteredCountChange}
+          />
+        ) : null}
+
+        {globalSearchOpen ? (
+          <GlobalSearchPanel
+            onClose={closeGlobalSearch}
+            onOpenResult={(result, query) => void openGlobalSearchResult(result, query)}
+            onStatusChange={handleGlobalSearchStatusChange}
+          />
+        ) : null}
+
+        {referencesOpen ? (
+          <ReferenceDashboard
+            onClose={() => setReferencesOpen(false)}
+            onOpenDocument={(documentId) => {
+              setReferencesOpen(false)
+              void openWorkspaceDocument(documentId)
+            }}
+            onOpenHighlight={(highlight) => {
+              setReferencesOpen(false)
+              void openWorkspaceDocument(highlight.documentId, { highlight })
+            }}
+            onStatusChange={setReferenceStatus}
+          />
+        ) : null}
+
+        {mergePdfsOpen ? (
+          <MergePdfsPanel
+            onClose={() => setMergePdfsOpen(false)}
+            onOpenPdf={(opened) => {
+              setMergePdfsOpen(false)
+              openResultInTab(opened)
+            }}
+            onRefreshRecent={refreshRecentFiles}
+          />
+        ) : null}
+
+        {imagesToPdfOpen ? (
+          <ImagesToPdfPanel
+            onClose={() => setImagesToPdfOpen(false)}
+            onOpenPdf={(opened) => {
+              setImagesToPdfOpen(false)
+              openResultInTab(opened)
+            }}
+            onRefreshRecent={refreshRecentFiles}
+          />
+        ) : null}
+
+        {signatureManagerOpen ? (
+          <SignatureManagerPanel onClose={() => setSignatureManagerOpen(false)} />
+        ) : null}
+
+        {workspaceManagerOpen ? (
+          <WorkspaceManager
+            workspaces={workspaceList}
+            activeWorkspaceId={activeWorkspaceId}
+            details={workspaceDetails}
+            loading={workspaceLoading}
+            error={workspaceError}
+            onClose={() => setWorkspaceManagerOpen(false)}
+            onSelect={(id) => void refreshWorkspaceManager(id)}
+            onActivate={switchToWorkspace}
+            onRefresh={refreshWorkspaceManager}
+            onDelete={deleteWorkspace}
+            onOpenDocument={(id, options) => void openWorkspaceDocument(id, { ...options, workspaceId: workspaceDetails?.id })}
+            onAddDocument={() => {
+              setWorkspaceManagerOpen(false)
+              void openPdf()
+            }}
+            onImport={importWorkspace}
+          />
+        ) : null}
+
+        <div ref={splitContainerRef} className={`${globalDashboardOpen || globalSearchOpen || workspaceManagerOpen || referencesOpen || mergePdfsOpen || imagesToPdfOpen || signatureManagerOpen ? 'hidden' : 'flex'} min-w-0 items-start gap-2`}>
           {pdfDocument && pdfFile ? (
             <aside
               className={`relative sticky flex shrink-0 flex-col rounded-2xl border border-slate-700 bg-[#111827] shadow-xl shadow-slate-950/20 ${
@@ -3160,6 +6148,31 @@ function App() {
               >
                 <SidebarToggleIcon expanded={thumbnailSidebarOpen} />
               </button>
+
+              <div className="border-b border-slate-700/80 p-2">
+                <button
+                  type="button"
+                  onClick={() => void openWorkspaceManager()}
+                  className={`group/sidebar-tab relative mb-1 flex w-full items-center justify-center rounded-xl border border-transparent font-semibold text-slate-400 transition-all duration-200 hover:border-blue-400/50 hover:bg-blue-500/15 hover:text-blue-100 ${
+                    thumbnailSidebarOpen ? 'gap-2 px-3 py-2.5 text-xs' : 'size-10'
+                  }`}
+                  title="Workspaces"
+                >
+                  <WorkspaceIcon />
+                  {thumbnailSidebarOpen ? <span>Workspaces</span> : <span className="sr-only">Workspaces</span>}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void openHighlightLibrary()}
+                  className={`group/sidebar-tab relative flex w-full items-center justify-center rounded-xl border border-transparent font-semibold text-slate-400 transition-all duration-200 hover:border-blue-400/50 hover:bg-blue-500/15 hover:text-blue-100 ${
+                    thumbnailSidebarOpen ? 'gap-2 px-3 py-2.5 text-xs' : 'size-10'
+                  }`}
+                  title="All Highlights"
+                >
+                  <HighlightsIcon />
+                  {thumbnailSidebarOpen ? <span>All Highlights</span> : <span className="sr-only">All Highlights</span>}
+                </button>
+              </div>
 
               <div
                 role="tablist"
@@ -3284,8 +6297,9 @@ function App() {
                 </div>
               ) : thumbnailSidebarOpen && sidebarTab === 'highlights' ? (
                 <HighlightsPanel
-                  highlights={highlights}
-                  onNavigate={navigateToHighlight}
+                  highlights={sidebarHighlights}
+                  documentSelected={Boolean(sidebarDocument)}
+                  onNavigate={navigateSidebarHighlight}
                   onRemove={removeHighlight}
                   onContextMenu={showHighlightContextMenu}
                   editingNoteId={editingNoteId}
@@ -3319,18 +6333,133 @@ function App() {
             </aside>
           ) : null}
 
-          <div className="min-w-0 flex-1">
+          <div
+            ref={leftPaneContainerRef}
+            data-pane="left"
+            data-pane-tab-id={leftPane.tabId ?? ''}
+            data-pane-document-id={leftPane.documentId ?? ''}
+            onPointerDown={() => focusPane('left')}
+            onDragOver={(event) => {
+              if (event.dataTransfer.types.includes('application/x-next-pdf-tab')) {
+                event.preventDefault()
+                event.dataTransfer.dropEffect = 'move'
+              }
+            }}
+            onDrop={(event) => {
+              const tabId = event.dataTransfer.getData('application/x-next-pdf-tab')
+              if (tabId) {
+                event.preventDefault()
+                openTabInLeftPane(tabId)
+              }
+            }}
+            className={`min-w-0 ${splitEnabled ? 'shrink basis-0 rounded-xl border' : 'flex-1'} ${
+              splitEnabled && activePane === 'left'
+                ? 'border-blue-400/90 ring-2 ring-blue-400/25'
+                : splitEnabled
+                  ? 'border-slate-700/90'
+                  : ''
+            } ${splitResizing ? '' : 'transition-[flex-grow] duration-200'}`}
+            style={splitEnabled ? { flexGrow: splitRatio } : undefined}
+          >
+            {splitEnabled ? (
+              <PdfPaneHeader
+                active={activePane === 'left'}
+                paneLabel="Left Pane"
+                fileName={pdfFile?.name}
+                currentPage={currentPage}
+                totalPages={numPages || 0}
+                zoomPercent={Math.round(displayZoom * 100)}
+              />
+            ) : null}
+            {splitEnabled && pdfFile ? (
+              <PdfPaneToolbar
+                active={activePane === 'left'}
+                currentPage={currentPage}
+                totalPages={numPages}
+                pageInput={pageInput}
+                zoomPercent={Math.round(displayZoom * 100)}
+                fitActive={zoomMode === 'fit-width'}
+                searchActive={searchOpen}
+                panelsActive={thumbnailSidebarOpen}
+                onPageInputChange={setPageInput}
+                onPageSubmit={submitPageInput}
+                onPreviousPage={() => goToPage(currentPage - 1)}
+                onNextPage={() => goToPage(currentPage + 1)}
+                onZoomOut={() => changeZoom(displayZoomRef.current - 0.1)}
+                onResetZoom={() => changeZoom(1)}
+                onZoomIn={() => changeZoom(displayZoomRef.current + 0.1)}
+                onFitWidth={fitWidth}
+                onRotateLeft={() => rotatePages(-90)}
+                onRotateRight={() => rotatePages(90)}
+                onSearch={() => setSearchOpen((open) => !open)}
+                onTogglePanels={toggleSidebar}
+              />
+            ) : null}
             {!pdfFile ? (
-              <div className="rounded-2xl border border-dashed border-slate-600 bg-[#111827] px-8 py-16 text-center text-slate-300 shadow-xl shadow-slate-950/20">
-                Click Open PDF and choose a local PDF file.
+              <div className="mx-auto mt-8 w-full max-w-3xl rounded-3xl border border-slate-700 bg-gradient-to-br from-slate-900 to-slate-950 px-6 py-12 text-center shadow-2xl shadow-slate-950/30 sm:px-12">
+                <div className="mx-auto grid size-16 place-items-center rounded-2xl bg-blue-500/15 text-blue-300">
+                  <FileIcon />
+                </div>
+                <h1 className="mt-5 text-2xl font-semibold tracking-tight text-white">Open a PDF workspace</h1>
+                <p className="mx-auto mt-2 max-w-lg text-sm leading-6 text-slate-400">
+                  Open a document, choose a recent file, or drag and drop a PDF anywhere in this window.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void openPdf()}
+                  className="mt-6 h-11 rounded-xl bg-blue-500 px-6 text-sm font-semibold text-white shadow-lg shadow-blue-950/30 transition hover:bg-blue-400"
+                >
+                  Open PDF
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void openWorkspaceManager()}
+                  className="ml-2 mt-6 h-11 rounded-xl border border-slate-700 px-5 text-sm font-semibold text-slate-200 transition hover:bg-slate-800"
+                >
+                  Create or Open Workspace
+                </button>
+                <button type="button" onClick={openReferences} className="ml-2 mt-6 h-11 rounded-xl border border-cyan-700/70 px-5 text-sm font-semibold text-cyan-200 transition hover:bg-cyan-950/40">Reference Library</button>
+                {workspaceList.length > 0 ? (
+                  <div className="mx-auto mt-8 max-w-xl border-t border-slate-800 pt-6 text-left">
+                    <h2 className="mb-3 text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Recent Workspaces</h2>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {workspaceList.slice(0, 4).map((workspace) => (
+                        <button key={workspace.id} type="button" onClick={() => workspace.id === activeWorkspaceId ? void openWorkspaceManager() : void switchToWorkspace(workspace.id)} className="flex min-w-0 items-center gap-2 rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-3 text-left text-sm text-slate-300 transition hover:border-slate-600 hover:bg-slate-800">
+                          <span className="size-2.5 shrink-0 rounded-full" style={{ background: workspace.color }} /><span className="truncate">{workspace.name}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                {recentFiles.length > 0 ? (
+                  <div className="mx-auto mt-8 max-w-xl border-t border-slate-800 pt-6 text-left">
+                    <h2 className="mb-3 text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Recent Files</h2>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {recentFiles.slice(0, 6).map((recentFile) => (
+                        <button
+                          key={recentFile.id}
+                          type="button"
+                          title={recentFile.name}
+                          onClick={() => void openRecentPdf(recentFile.id)}
+                          className="flex min-w-0 items-center gap-2 rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-3 text-left text-sm text-slate-300 transition hover:border-slate-600 hover:bg-slate-800"
+                        >
+                          <FileIcon />
+                          <span className="truncate">{recentFile.name}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                <p className="mt-7 text-xs text-slate-600">Drag &amp; Drop PDF Here</p>
               </div>
             ) : (
               <div
                 className="overflow-auto rounded-xl p-3 shadow-inner shadow-black/20 transition-colors duration-200 sm:p-4"
                 style={{ backgroundColor: VIEWER_BACKGROUNDS[viewerBackground] }}
               >
-                <div ref={viewerRef} className="min-w-0">
+                <div ref={viewerRef} tabIndex={-1} className="min-w-0 outline-none">
                   <Document
+                    key={`${leftPane.tabId ?? 'left'}:${leftPane.documentId ?? pdfFile.id}`}
                     file={pdfFile.dataUrl}
                     loading={<StatusMessage>Loading PDF...</StatusMessage>}
                     error={<StatusMessage>PDF failed to load.</StatusMessage>}
@@ -3393,6 +6522,10 @@ function App() {
                           viewMode === 'single' || renderedPageNumbers.has(pageNumber)
                         const pageHighlights =
                           highlightsByPage.get(pageNumber) ?? EMPTY_HIGHLIGHTS
+                        const pageSignaturePlacements =
+                          signaturePlacementsByPage.get(pageNumber) ?? []
+                        const pageFillSignFields =
+                          fillSignFieldsByPage.get(pageNumber) ?? []
                         const pageFocusedHighlightId = pageHighlights.some(
                           (highlight) => highlight.id === focusedHighlightId,
                         )
@@ -3431,6 +6564,41 @@ function App() {
                                 highlights={pageHighlights}
                                 rotation={rotation}
                                 focusedHighlightId={pageFocusedHighlightId}
+                              />
+                              <SignaturePlacementOverlay
+                                pageNumber={pageNumber}
+                                pageRotation={rotation}
+                                placements={pageSignaturePlacements}
+                                signatures={savedSignatures}
+                                signingSignature={
+                                  (!splitEnabled || activePane === 'left') ? signingSignature : null
+                                }
+                                selectedPlacementId={
+                                  (!splitEnabled || activePane === 'left') ? selectedSignaturePlacementId : null
+                                }
+                                onPlace={addLeftSignaturePlacement}
+                                onSelect={setSelectedSignaturePlacementId}
+                                onUpdate={updateLeftSignaturePlacement}
+                                onDelete={deleteLeftSignaturePlacement}
+                                onDuplicate={duplicateLeftSignaturePlacement}
+                                onBringForward={bringLeftSignatureForward}
+                                onSendBackward={sendLeftSignatureBackward}
+                                onFinishSigning={() => setSigningSignature(null)}
+                              />
+                              <FillSignOverlay
+                                pageNumber={pageNumber}
+                                pageRotation={rotation}
+                                fields={pageFillSignFields}
+                                activeTool={(!splitEnabled || activePane === 'left') ? activeFillSignTool : null}
+                                selectedFieldId={(!splitEnabled || activePane === 'left') ? selectedFillSignFieldId : null}
+                                dateFormat={fillSignDateFormat}
+                                initials={defaultInitials}
+                                onPlace={addLeftFillSignField}
+                                onSelect={setSelectedFillSignFieldId}
+                                onUpdate={updateLeftFillSignField}
+                                onDelete={deleteLeftFillSignField}
+                                onDuplicate={duplicateLeftFillSignField}
+                                onFinishTool={() => setActiveFillSignTool(null)}
                               />
                               {shouldRender ? (
                                 <RotatedPage
@@ -3472,6 +6640,103 @@ function App() {
               </div>
             )}
           </div>
+
+          {splitEnabled ? (
+            <>
+              <div
+                role="separator"
+                aria-label="Resize split panes"
+                aria-orientation="vertical"
+                aria-valuemin={25}
+                aria-valuemax={75}
+                aria-valuenow={Math.round(splitRatio * 100)}
+                onPointerDown={startSplitResize}
+                className={`group sticky z-20 h-[calc(100vh-5rem)] w-2 shrink-0 cursor-col-resize rounded-full transition-colors ${
+                  splitResizing ? 'bg-blue-400/35' : 'bg-slate-800 hover:bg-blue-400/25'
+                }`}
+                style={{ top: headerHeight + 16 }}
+              >
+                <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-slate-600 group-hover:bg-blue-300" />
+              </div>
+              <div
+                data-pane="right"
+                data-pane-tab-id={rightPane.tabId ?? ''}
+                data-pane-document-id={rightPane.documentId ?? ''}
+                className={`sticky min-w-0 shrink basis-0 ${splitResizing ? '' : 'transition-[flex-grow] duration-200'}`}
+                style={{
+                  top: headerHeight + 16,
+                  height: `calc(100vh - ${headerHeight + 60}px)`,
+                  flexGrow: 1 - splitRatio,
+                }}
+              >
+                {rightDocument && rightPaneState && rightDocument.id === rightPane.documentId ? (
+                <SplitDocumentPane
+                  key={`${rightPane.id}:${rightPane.tabId ?? 'empty'}:${rightPane.documentId ?? rightDocument.id}`}
+                  ref={rightPaneRef}
+                  paneLabel="Right Pane"
+                  document={rightDocument}
+                  initialState={rightPaneState}
+                  active={activePane === 'right'}
+                  viewerBackground={VIEWER_BACKGROUNDS[viewerBackground]}
+                  onActivate={() => focusPane('right')}
+                  onCloseSplit={closeSplitView}
+                  onDropTab={(tabId) => void openTabInRightPane(tabId)}
+                  onStateChange={updateRightTabState}
+                  onHighlightsChange={handleSplitHighlightsChange}
+                  signatures={savedSignatures}
+                  signingSignature={activePane === 'right' ? signingSignature : null}
+                  selectedSignaturePlacementId={activePane === 'right' ? selectedSignaturePlacementId : null}
+                  onSignaturePlacementsChange={updateRightSignaturePlacements}
+                  onSignaturePlacementSelect={setSelectedSignaturePlacementId}
+                  activeFillSignTool={activePane === 'right' ? activeFillSignTool : null}
+                  selectedFillSignFieldId={activePane === 'right' ? selectedFillSignFieldId : null}
+                  fillSignDateFormat={fillSignDateFormat}
+                  fillSignInitials={defaultInitials}
+                  onFillSignFieldsChange={updateRightFillSignFields}
+                  onFillSignFieldSelect={setSelectedFillSignFieldId}
+                  onFinishFillSignTool={() => setActiveFillSignTool(null)}
+                  onFinishSigning={() => setSigningSignature(null)}
+                  onSearchStatus={setRightSearchStatus}
+                  onViewStatus={setRightViewStatus}
+                  onScrollPosition={applyRightScrollToLeft}
+                />
+                ) : (
+                  <section
+                    tabIndex={-1}
+                    onPointerDown={() => focusPane('right')}
+                    className={`flex h-full flex-col overflow-hidden rounded-xl border bg-slate-900 outline-none ${
+                      activePane === 'right'
+                        ? 'border-blue-400/90 ring-2 ring-blue-400/25'
+                        : 'border-slate-700/90'
+                    }`}
+                  >
+                    <PdfPaneHeader
+                      active={activePane === 'right'}
+                      paneLabel="Right Pane"
+                      onClose={closeSplitView}
+                    />
+                    <div className="grid min-h-0 flex-1 place-items-center p-6 text-center" style={{ backgroundColor: VIEWER_BACKGROUNDS[viewerBackground] }}>
+                      <div className="w-full max-w-sm rounded-2xl border border-dashed border-slate-600 bg-slate-900/80 p-6">
+                        <FileIcon />
+                        <h2 className="mt-3 font-semibold text-white">Open PDF in this pane</h2>
+                        <p className="mt-1 text-xs text-slate-400">Drag a PDF here or choose a recent file.</p>
+                        <button type="button" onClick={() => void openPdf('right')} className="mt-4 rounded-lg bg-blue-500 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-400">Open PDF</button>
+                        {recentFiles.length ? (
+                          <div className="mt-4 space-y-1 border-t border-slate-700 pt-3 text-left">
+                            {recentFiles.slice(0, 4).map((recentFile) => (
+                              <button key={recentFile.id} type="button" title={recentFile.name} onClick={() => void openRecentPdf(recentFile.id, 'right')} className="block w-full truncate rounded-lg px-2 py-1.5 text-xs text-slate-300 hover:bg-slate-800">
+                                {recentFile.name}
+                              </button>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  </section>
+                )}
+              </div>
+            </>
+          ) : null}
         </div>
       </section>
 
@@ -3480,37 +6745,297 @@ function App() {
         aria-live="polite"
         className="fixed inset-x-0 bottom-0 z-40 flex h-8 items-center justify-end gap-1 border-t border-slate-700 bg-[#111827]/98 px-3 text-[11px] font-medium text-slate-300 shadow-[0_-4px_14px_rgba(2,6,23,0.18)] backdrop-blur sm:px-4"
       >
-        {pdfFile ? (
+        {referencesOpen ? (
           <>
-            <StatusItem>Page {currentPage} of {numPages || 0}</StatusItem>
+            <StatusItem>References: {referenceStatus.references}</StatusItem>
             <StatusDivider />
-            <StatusItem>{Math.round(displayZoom * 100)}%</StatusItem>
+            <StatusItem>Filtered: {referenceStatus.filtered}</StatusItem>
             <StatusDivider />
-            <StatusItem>{zoomMode === 'fit-width' ? 'Fit Width' : 'Manual Zoom'}</StatusItem>
+            <StatusItem>Workspace: {workspaceList.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? 'My Research'}</StatusItem>
+          </>
+        ) : workspaceManagerOpen && workspaceDetails ? (
+          <>
+            <StatusItem>Workspace: {workspaceDetails.name}</StatusItem>
+            <StatusDivider />
+            <StatusItem>Documents: {workspaceDetails.stats.documents}</StatusItem>
+            <StatusDivider />
+            <StatusItem>Highlights: {workspaceDetails.stats.highlights}</StatusItem>
+          </>
+        ) : globalSearchOpen ? (
+          <>
+            <StatusItem>Results: {globalSearchStatus.total}</StatusItem>
+            <StatusDivider />
+            <StatusItem>Highlights: {globalSearchStatus.counts.highlights}</StatusItem>
+            <StatusDivider />
+            <StatusItem>Notes: {globalSearchStatus.counts.notes}</StatusItem>
+            <StatusDivider />
+            <StatusItem>PDFs: {globalSearchStatus.counts.documents}</StatusItem>
+          </>
+        ) : globalDashboardOpen ? (
+          <>
+            <StatusItem>Highlights: {highlightLibrary.stats.totalHighlights}</StatusItem>
+            <StatusDivider />
+            <StatusItem>PDFs: {highlightLibrary.stats.totalDocuments}</StatusItem>
+            <StatusDivider />
+            <StatusItem>Filtered: {highlightLibraryFilteredCount}</StatusItem>
+          </>
+        ) : pdfFile || (splitEnabled && rightDocument) ? (
+          <>
+            <StatusItem>Workspace: {workspaceList.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? 'My Research'}</StatusItem>
+            <StatusDivider />
+            {splitEnabled ? (
+              <>
+                <StatusItem>{activePane === 'right' ? 'Right Pane' : 'Left Pane'}</StatusItem>
+                <StatusDivider />
+              </>
+            ) : null}
+            {(activePane === 'left' && !pdfFile) || (splitEnabled && activePane === 'right' && !rightPaneState) ? (
+              <StatusItem>No document</StatusItem>
+            ) : (
+              <>
+                <StatusItem>Page {splitEnabled && activePane === 'right' ? rightViewStatus.page : currentPage} of {splitEnabled && activePane === 'right' ? rightViewStatus.totalPages : numPages || 0}</StatusItem>
+                <StatusDivider />
+                <StatusItem>{Math.round((splitEnabled && activePane === 'right' ? rightViewStatus.zoom : displayZoom) * 100)}%</StatusItem>
+                <StatusDivider />
+                <StatusItem>{splitEnabled && activePane === 'right' ? (rightViewStatus.fitMode ? 'Fit Width' : 'Manual Zoom') : zoomMode === 'fit-width' ? 'Fit Width' : 'Manual Zoom'}</StatusItem>
+              </>
+            )}
             <StatusDivider />
             <StatusItem>{VIEWER_BACKGROUND_LABELS[viewerBackground]}</StatusItem>
-            {searchOpen ? (
+            {(splitEnabled && activePane === 'right' ? rightPaneState?.searchOpen : searchOpen) ? (
               <>
                 <StatusDivider />
                 <StatusItem>
-                  {isSearching
-                    ? searchProgress
-                      ? `Searching ${searchProgress.processed} of ${searchProgress.total}`
-                      : 'Searching...'
-                    : searchMatches.length > 0
-                      ? `Match ${selectedMatchIndex + 1} of ${searchMatches.length}`
-                      : searchQuery.trim()
+                  {splitEnabled && activePane === 'right'
+                    ? rightSearchStatus.total > 0
+                      ? `Match ${rightSearchStatus.current} of ${rightSearchStatus.total}`
+                      : rightSearchStatus.query
                         ? 'No results'
-                        : 'Search active'}
+                        : 'Search active'
+                    : isSearching
+                      ? searchProgress
+                        ? `Searching ${searchProgress.processed} of ${searchProgress.total}`
+                        : 'Searching...'
+                      : searchMatches.length > 0
+                        ? `Match ${selectedMatchIndex + 1} of ${searchMatches.length}`
+                        : searchQuery.trim()
+                          ? 'No results'
+                          : 'Search active'}
                 </StatusItem>
+              </>
+            ) : null}
+            {searchIndexProgress ? (
+              <>
+                <StatusDivider />
+                <StatusItem>Indexing {searchIndexProgress.indexed} of {searchIndexProgress.total}</StatusItem>
               </>
             ) : null}
           </>
         ) : (
-          <StatusItem>No PDF open</StatusItem>
+          <>
+            <StatusItem>Workspace: {workspaceList.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? 'My Research'}</StatusItem>
+            <StatusDivider />
+            <StatusItem>No PDF open</StatusItem>
+          </>
         )}
       </footer>
     </main>
+  )
+}
+
+function createTabState(
+  readingState: OpenedPdf['readingState'],
+  sidebar: { sidebarOpen: boolean; sidebarTab: SidebarTab; sidebarWidth: number },
+): PdfTabState {
+  return {
+    page: Math.max(1, readingState.page),
+    pageOffset: 0,
+    zoom: clampScale(readingState.zoom),
+    fitMode: readingState.fitMode,
+    rotation: normalizeRotation(readingState.rotation),
+    searchOpen: false,
+    searchQuery: '',
+    selectedMatchIndex: -1,
+    ...sidebar,
+  }
+}
+
+function getSidebarDocumentContext({
+  splitEnabled,
+  activePane,
+  leftDocument,
+  leftHighlights,
+  leftPane,
+  rightPane,
+  rightDocument,
+}: {
+  splitEnabled: boolean
+  activePane: PaneSide
+  leftDocument: PdfFile | null
+  leftHighlights: PdfHighlight[]
+  leftPane: PaneAssignment
+  rightPane: PaneAssignment
+  rightDocument: SplitPaneDocument | null
+}) {
+  const paneId: PaneSide = splitEnabled ? activePane : 'left'
+  const pane = paneId === 'right' ? rightPane : leftPane
+  const document = paneId === 'right' ? rightDocument : leftDocument
+  return {
+    paneId,
+    tabId: pane.tabId,
+    document,
+    documentId: document?.id ?? null,
+    filePath: document?.filePath ?? null,
+    fileName: document?.name ?? null,
+    highlights: paneId === 'right'
+      ? rightDocument?.highlights ?? EMPTY_HIGHLIGHTS
+      : leftHighlights,
+  }
+}
+
+function emptyPane(side: PaneSide): PaneAssignment {
+  return {
+    id: side,
+    tabId: null,
+    documentId: null,
+    fileName: null,
+    state: null,
+  }
+}
+
+function toSplitPaneState(state: PdfTabState): SplitPaneState {
+  return {
+    page: state.page,
+    pageOffset: state.pageOffset,
+    zoom: state.zoom,
+    fitMode: state.fitMode,
+    rotation: state.rotation,
+    searchOpen: state.searchOpen,
+    searchQuery: state.searchQuery,
+    selectedMatchIndex: state.selectedMatchIndex,
+    sidebarOpen: state.sidebarOpen,
+    sidebarTab:
+      state.sidebarTab === 'bookmarks'
+        ? 'bookmarks'
+        : state.sidebarTab === 'highlights'
+          ? 'highlights'
+          : 'pages',
+    sidebarWidth: Math.min(320, Math.max(180, state.sidebarWidth)),
+  }
+}
+
+function fromSplitPaneState(state: SplitPaneState, previous: PdfTabState): PdfTabState {
+  return {
+    page: state.page,
+    pageOffset: state.pageOffset,
+    zoom: state.zoom,
+    fitMode: state.fitMode,
+    rotation: state.rotation,
+    searchOpen: state.searchOpen,
+    searchQuery: state.searchQuery,
+    selectedMatchIndex: state.selectedMatchIndex,
+    sidebarOpen: state.sidebarOpen,
+    sidebarTab:
+      state.sidebarTab === 'bookmarks'
+        ? 'bookmarks'
+        : state.sidebarTab === 'highlights'
+          ? 'highlights'
+          : previous.sidebarTab === 'info'
+            ? 'info'
+            : 'thumbnails',
+    sidebarWidth: Math.min(400, Math.max(220, state.sidebarWidth)),
+  }
+}
+
+function tabStatesEqual(left: PdfTabState, right: PdfTabState) {
+  return (
+    left.page === right.page &&
+    Math.abs(left.pageOffset - right.pageOffset) < 0.001 &&
+    Math.abs(left.zoom - right.zoom) < 0.001 &&
+    left.fitMode === right.fitMode &&
+    left.rotation === right.rotation &&
+    left.searchOpen === right.searchOpen &&
+    left.searchQuery === right.searchQuery &&
+    left.selectedMatchIndex === right.selectedMatchIndex &&
+    left.sidebarOpen === right.sidebarOpen &&
+    left.sidebarTab === right.sidebarTab &&
+    left.sidebarWidth === right.sidebarWidth
+  )
+}
+
+function createTabId() {
+  return window.crypto.randomUUID()
+}
+
+function duplicateFillSignField(field: FillSignField): FillSignField {
+  const width = field.widthRatio ?? field.width
+  const height = field.heightRatio ?? field.height
+  const x = Math.min(1 - width, (field.xRatio ?? field.x) + 0.03)
+  const y = Math.min(1 - height, (field.yRatio ?? field.y) + 0.03)
+  return {
+    ...field,
+    id: window.crypto.randomUUID(),
+    x,
+    y,
+    xRatio: x,
+    yRatio: y,
+    width,
+    height,
+    widthRatio: width,
+    heightRatio: height,
+    createdAt: new Date().toISOString(),
+  }
+}
+
+function initialsFromSignatures(signatures: SavedSignature[]) {
+  const preferred = signatures.find((signature) => signature.isDefault) ?? signatures[0]
+  const name = preferred?.name?.replace(/\.(png|jpe?g|webp)$/i, '').trim() ?? ''
+  const initials = name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 3)
+    .map((part) => part[0]?.toUpperCase())
+    .join('')
+  return initials || 'Initials'
+}
+
+function fillSignToolLabel(tool: FillSignTool) {
+  if (tool === 'date') return 'a date'
+  if (tool === 'initials') return 'initials'
+  if (tool === 'checkbox') return 'a checkbox'
+  return 'text'
+}
+
+function fillSignToolButtonClass(active: boolean) {
+  return `grid h-8 min-w-8 place-items-center rounded-md px-2 text-xs font-bold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${
+    active
+      ? 'bg-cyan-500/20 text-cyan-100 ring-1 ring-cyan-400/70'
+      : 'text-slate-300 hover:bg-slate-800'
+  }`
+}
+
+function isEditableKeyboardTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false
+  if (target.isContentEditable) return true
+  return ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+}
+
+function TabMenuButton({
+  children,
+  onClick,
+}: {
+  children: React.ReactNode
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors duration-150 hover:bg-slate-800"
+    >
+      {children}
+    </button>
   )
 }
 
@@ -3579,6 +7104,7 @@ function PagePlaceholder({
 
 function HighlightsPanel({
   highlights,
+  documentSelected,
   onNavigate,
   onRemove,
   onContextMenu,
@@ -3591,6 +7117,7 @@ function HighlightsPanel({
   onExport,
 }: {
   highlights: PdfHighlight[]
+  documentSelected: boolean
   onNavigate: (highlight: PdfHighlight) => void
   onRemove: (highlightId: string) => void
   onContextMenu: (event: React.MouseEvent, highlightId: string) => void
@@ -3678,7 +7205,11 @@ function HighlightsPanel({
         ))}
       </div>
 
-      {highlights.length === 0 ? (
+      {!documentSelected ? (
+        <p className="rounded-xl border border-dashed border-slate-700 px-3 py-8 text-center text-sm leading-5 text-slate-400">
+          No document selected
+        </p>
+      ) : highlights.length === 0 ? (
         <p className="rounded-xl border border-dashed border-slate-700 px-3 py-8 text-center text-sm leading-5 text-slate-400">
           Select PDF text to create a highlight.
         </p>
@@ -4121,6 +7652,107 @@ function StatusItem({ children }: { children: React.ReactNode }) {
   )
 }
 
+function PdfToolsIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4 shrink-0" fill="none" aria-hidden="true">
+      <path d="M5 4.5h8l4 4V19a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 4 19V6A1.5 1.5 0 0 1 5.5 4.5Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
+      <path d="M13 4.5V9h4M8 13h5M8 16h8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function MergePdfIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4 shrink-0 text-blue-300" fill="none" aria-hidden="true">
+      <path d="M6 4.5h6l3 3V16H6V4.5ZM12 4.5V8h3" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="M9 18.5h9V10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M8.5 11h4M8.5 13.5h4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function ImagesToPdfIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4 shrink-0 text-emerald-300" fill="none" aria-hidden="true">
+      <rect x="4" y="5" width="16" height="13.5" rx="2" stroke="currentColor" strokeWidth="1.6" />
+      <path d="m6.8 16 3.2-3.3 2.3 2.2 2.1-2.8 2.8 3.9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="9" cy="9" r="1.2" fill="currentColor" />
+    </svg>
+  )
+}
+
+function SignatureToolIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4 shrink-0 text-amber-300" fill="none" aria-hidden="true">
+      <path d="M14.5 4.5 19 9 9.7 18.3 5 19l.7-4.7 8.8-9.8Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="M13 6.3 17.2 10.5M4 21h16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function SignedCopyIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4 shrink-0 text-emerald-300" fill="none" aria-hidden="true">
+      <path d="M6 3.5h8l4 4V20a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 5 20V5A1.5 1.5 0 0 1 6.5 3.5Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="M14 3.5V8h4" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="m8 15 2.3 2.3L16 11.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function CalendarIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4" fill="none" aria-hidden="true">
+      <rect x="4" y="5.5" width="16" height="14" rx="2" stroke="currentColor" strokeWidth="1.7" />
+      <path d="M8 3.5v4M16 3.5v4M4 10h16M8 14h2M12 14h2M16 14h1" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function CheckBoxIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4" fill="none" aria-hidden="true">
+      <rect x="4.5" y="4.5" width="15" height="15" rx="2" stroke="currentColor" strokeWidth="1.8" />
+      <path d="m8 12 3 3 5-6" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function DateFormatIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4" fill="none" aria-hidden="true">
+      <rect x="4" y="5" width="16" height="15" rx="2" stroke="currentColor" strokeWidth="1.7" />
+      <path d="M8 3.5v3M16 3.5v3M4 9h16M7.5 13h3M13.5 13H16M7.5 16h5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function ChevronDownIcon({ open }: { open: boolean }) {
+  return (
+    <svg viewBox="0 0 20 20" className={`size-3 shrink-0 text-slate-500 transition-transform duration-150 ${open ? 'rotate-180' : ''}`} fill="none" aria-hidden="true">
+      <path d="m5 7.5 5 5 5-5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function WorkspaceIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5 shrink-0" fill="none" aria-hidden="true">
+      <path d="M3.5 7.5h6l1.7 2h9.3v9.5a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 19V7.5Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
+      <path d="M5.5 7.5V5A1.5 1.5 0 0 1 7 3.5h4l1.5 2H18A1.5 1.5 0 0 1 19.5 7v2.5" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function ReferencesIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5 shrink-0" fill="none" aria-hidden="true">
+      <path d="M5 4.5h11.5A2.5 2.5 0 0 1 19 7v12.5H7.5A2.5 2.5 0 0 1 5 17V4.5Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
+      <path d="M5 17a2.5 2.5 0 0 1 2.5-2.5H19M9 8h6M9 11h4" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function PreviousPageIcon() {
   return (
     <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
@@ -4230,6 +7862,17 @@ function SearchIcon() {
   )
 }
 
+function GlobalSearchIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="size-4 fill-none stroke-current stroke-2">
+      <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H14v9H6.5A2.5 2.5 0 0 0 4 14.5z" />
+      <path d="M4 5.5v9A2.5 2.5 0 0 0 6.5 17H10M8 6h3M8 9h3" />
+      <circle cx="16" cy="16" r="3.5" />
+      <path d="m18.7 18.7 2.3 2.3" />
+    </svg>
+  )
+}
+
 function ThumbnailsIcon() {
   return (
     <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
@@ -4315,6 +7958,16 @@ function FullscreenIcon() {
   )
 }
 
+function SplitViewIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M12 4v16" />
+      <path d="m9 10-2 2 2 2M15 10l2 2-2 2" />
+    </svg>
+  )
+}
+
 function ExitFullscreenIcon() {
   return (
     <svg viewBox="0 0 24 24" className="size-5" fill="none" aria-hidden="true">
@@ -4372,16 +8025,6 @@ function highlightColorClass(color: HighlightColor) {
         : 'bg-violet-300'
 }
 
-function highlightColorSwatchClass(color: HighlightColor) {
-  return color === 'yellow'
-    ? 'border-amber-100 bg-amber-300'
-    : color === 'green'
-      ? 'border-emerald-100 bg-emerald-300'
-      : color === 'blue'
-        ? 'border-sky-100 bg-sky-300'
-        : 'border-violet-100 bg-violet-300'
-}
-
 function highlightCategoryColorClass(category: HighlightCategory) {
   return category === 'important'
     ? 'bg-yellow-400'
@@ -4412,6 +8055,12 @@ function rectanglesOverlap(left: HighlightRectangle, right: HighlightRectangle) 
 
 function normalizeHighlightText(text: string) {
   return text.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+}
+
+function globalSearchNavigationTerm(query: string) {
+  const phrase = query.match(/"([^"]+)"/)?.[1]
+  if (phrase?.trim()) return phrase.trim()
+  return query.match(/[\p{L}\p{N}]+/u)?.[0] ?? query.trim()
 }
 
 function pointInsideRectangle(

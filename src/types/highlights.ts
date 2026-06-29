@@ -18,6 +18,7 @@ export type PdfHighlight = {
   rectangles: HighlightRectangle[]
   rotation: number
   createdDate: string
+  modifiedDate?: string
 }
 
 export type PendingHighlightSelection = {
