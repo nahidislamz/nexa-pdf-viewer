@@ -1,6 +1,35 @@
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { Document, Page, Thumbnail, pdfjs } from 'react-pdf'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
+import {
+  AddRegular,
+  ArrowLeftRegular,
+  ArrowRightRegular,
+  BookOpenRegular,
+  CalendarRegular,
+  CheckboxCheckedRegular,
+  ChevronDownRegular,
+  DarkThemeRegular,
+  DocumentPdfRegular,
+  FullScreenMaximizeRegular,
+  FullScreenMinimizeRegular,
+  HighlightRegular,
+  HistoryRegular,
+  MoreHorizontalRegular,
+  OpenFolderRegular,
+  PanelLeftRegular,
+  PenRegular,
+  PrintRegular,
+  SaveRegular,
+  SearchRegular,
+  SignatureRegular,
+  SplitHorizontalRegular,
+  TextAddTRegular,
+  TextBulletListSquareRegular,
+  ZoomFitRegular,
+  ZoomInRegular,
+  ZoomOutRegular,
+} from '@fluentui/react-icons'
 import { HighlightOverlay } from './components/Viewer/HighlightOverlay'
 import { HighlightSelectionToolbar } from './components/Viewer/HighlightSelectionToolbar'
 import { FillSignOverlay } from './components/Viewer/FillSignOverlay'
@@ -97,6 +126,16 @@ type SidebarTab = 'thumbnails' | 'bookmarks' | 'highlights' | 'info'
 type ViewMode = 'continuous' | 'single'
 type ViewerBackground = 'dark-gray' | 'black' | 'light-gray' | 'white'
 type PaneSide = 'left' | 'right'
+type ToolbarMenu =
+  | 'open'
+  | 'zoom'
+  | 'annotate'
+  | 'fill-sign'
+  | 'research'
+  | 'pdf-tools'
+  | 'theme'
+  | 'view'
+  | 'more'
 type WorkspaceSession = Awaited<ReturnType<Window['electronAPI']['getWorkspace']>>
 type WorkspaceNavigationOptions = { highlight?: HighlightLibraryEntry; workspaceId?: string }
 
@@ -354,6 +393,7 @@ function App() {
   const [isSavingSignedCopy, setIsSavingSignedCopy] = useState(false)
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
   const [pdfToolsMenuOpen, setPdfToolsMenuOpen] = useState(false)
+  const [toolbarMenuOpen, setToolbarMenuOpen] = useState<ToolbarMenu | null>(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [viewMode, setViewMode] = useState<ViewMode>('continuous')
   const [viewerBackground, setViewerBackground] = useState<ViewerBackground>('dark-gray')
@@ -818,6 +858,23 @@ function App() {
     return () => {
       document.removeEventListener('pointerdown', closePdfToolsOnOutsideInteraction, true)
       document.removeEventListener('focusin', closePdfToolsOnOutsideInteraction, true)
+    }
+  }, [])
+
+  useEffect(() => {
+    function closeToolbarMenuOnOutsideInteraction(event: PointerEvent | FocusEvent) {
+      const target = event.target as Node | null
+      if (target && headerRef.current?.contains(target)) {
+        return
+      }
+      setToolbarMenuOpen(null)
+    }
+
+    document.addEventListener('pointerdown', closeToolbarMenuOnOutsideInteraction, true)
+    document.addEventListener('focusin', closeToolbarMenuOnOutsideInteraction, true)
+    return () => {
+      document.removeEventListener('pointerdown', closeToolbarMenuOnOutsideInteraction, true)
+      document.removeEventListener('focusin', closeToolbarMenuOnOutsideInteraction, true)
     }
   }, [])
 
@@ -1678,6 +1735,12 @@ function App() {
       if (event.key === 'Escape' && pdfToolsMenuOpen) {
         event.preventDefault()
         setPdfToolsMenuOpen(false)
+        return
+      }
+
+      if (event.key === 'Escape' && toolbarMenuOpen) {
+        event.preventDefault()
+        setToolbarMenuOpen(null)
         return
       }
 
@@ -4813,6 +4876,46 @@ function App() {
     }
   }
 
+  function toggleToolbarMenu(menu: ToolbarMenu) {
+    setToolbarMenuOpen((current) => current === menu ? null : menu)
+    setPdfToolsMenuOpen(false)
+    setSignPickerOpen(false)
+  }
+
+  function closeToolbarMenu() {
+    setToolbarMenuOpen(null)
+  }
+
+  function setActiveZoomPreset(nextZoom: number) {
+    if (splitEnabled && activePane === 'right') {
+      const currentZoom = rightPaneState?.zoom ?? 1
+      rightPaneRef.current?.zoomBy(nextZoom - currentZoom)
+    } else {
+      changeZoom(nextZoom)
+    }
+    closeToolbarMenu()
+  }
+
+  function openPdfToolPanel(tool: 'merge' | 'images' | 'signatures') {
+    setWorkspaceManagerOpen(false)
+    setReferencesOpen(false)
+    setGlobalDashboardOpen(false)
+    setGlobalSearchOpen(false)
+    setMergePdfsOpen(tool === 'merge')
+    setImagesToPdfOpen(tool === 'images')
+    setSignatureManagerOpen(tool === 'signatures')
+    closeToolbarMenu()
+  }
+
+  function startFillSignTool(tool: FillSignTool) {
+    activateFillSignTool(tool)
+    closeToolbarMenu()
+  }
+
+  async function prepareSignatureMenu() {
+    await refreshSavedSignatures()
+  }
+
   return (
     <main className="min-h-screen bg-[#0f172a] text-slate-100">
       {dragActive ? (
@@ -5075,7 +5178,395 @@ function App() {
         ref={headerRef}
         className="sticky top-0 z-10 border-b border-slate-700 bg-[#111827]/95 px-3 py-2.5 shadow-lg shadow-slate-950/20 backdrop-blur sm:px-4"
       >
-        <div className="flex w-full flex-wrap items-center gap-1.5">
+        <div className="flex w-full items-center gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:thin]">
+          <div className="relative shrink-0">
+            <ToolbarCommandButton
+              active={toolbarMenuOpen === 'open'}
+              onClick={() => toggleToolbarMenu('open')}
+              title="Open and recent files"
+            >
+              <OpenFolderRegular className="size-5" />
+              <span>Open</span>
+              <ChevronDownRegular className="size-3.5" />
+            </ToolbarCommandButton>
+            {toolbarMenuOpen === 'open' ? (
+              <ToolbarMenuPanel align="left">
+                <ToolbarMenuItem onClick={() => {
+                  closeToolbarMenu()
+                  void openPdf()
+                }} icon={<OpenFolderRegular className="size-4" />}>Open PDF</ToolbarMenuItem>
+                <div className="my-1 border-t border-slate-700" />
+                <p className="px-3 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Recent Files</p>
+                {recentFiles.length > 0 ? recentFiles.slice(0, 8).map((recentFile) => (
+                  <ToolbarMenuItem key={recentFile.id} onClick={() => {
+                    closeToolbarMenu()
+                    void openRecentPdf(recentFile.id)
+                  }} icon={<HistoryRegular className="size-4" />} title={recentFile.name}>
+                    <span className="block max-w-52 truncate">{recentFile.name}</span>
+                  </ToolbarMenuItem>
+                )) : (
+                  <p className="px-3 py-2 text-sm text-slate-500">No recent PDFs</p>
+                )}
+              </ToolbarMenuPanel>
+            ) : null}
+          </div>
+
+          <FluentToolbarDivider />
+
+          <div className="flex h-10 shrink-0 items-center gap-1 rounded-lg border border-slate-700/80 bg-slate-900/55 px-1">
+            <ToolbarIconButton
+              label="Previous page"
+              title="Previous page (PageUp)"
+              onClick={() => goToActivePage('previous')}
+              disabled={splitEnabled && activePane === 'right' ? (rightPaneState?.page ?? 1) === 1 : numPages === 0 || currentPage === 1}
+            >
+              <ArrowLeftRegular className="size-5" />
+            </ToolbarIconButton>
+            <label className="flex h-8 items-center gap-1.5 rounded-md bg-slate-950/70 px-2 text-sm text-slate-300">
+              <span className="sr-only">Current page</span>
+              <input
+                type="number"
+                min="1"
+                max={Math.max(1, numPages)}
+                value={splitEnabled && activePane === 'right' ? String(rightPaneState?.page ?? 1) : pageInput}
+                disabled={numPages === 0 || (splitEnabled && activePane === 'right')}
+                onFocus={() => {
+                  pageInputFocusedRef.current = true
+                }}
+                onChange={(event) => setPageInput(event.target.value)}
+                onBlur={() => {
+                  pageInputFocusedRef.current = false
+                  submitPageInput()
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') event.currentTarget.blur()
+                }}
+                className="w-11 bg-transparent text-center text-slate-100 outline-none disabled:opacity-40"
+              />
+              <span className="whitespace-nowrap text-xs text-slate-500">/ {splitEnabled && activePane === 'right' ? rightViewStatus.totalPages || 0 : numPages || 0}</span>
+            </label>
+            <ToolbarIconButton
+              label="Next page"
+              title="Next page (PageDown)"
+              onClick={() => goToActivePage('next')}
+              disabled={splitEnabled && activePane === 'right' ? false : numPages === 0 || currentPage === numPages}
+            >
+              <ArrowRightRegular className="size-5" />
+            </ToolbarIconButton>
+          </div>
+
+          <FluentToolbarDivider />
+
+          <div className="relative shrink-0">
+            <div className="flex h-10 items-center gap-1 rounded-lg border border-slate-700/80 bg-slate-900/55 px-1">
+              <ToolbarIconButton
+                label="Zoom out"
+                title="Zoom out"
+                onClick={() => changeActiveZoom(-0.25)}
+                disabled={(splitEnabled && activePane === 'right' ? rightPaneState?.zoom ?? 1 : displayZoom) <= MIN_SCALE}
+              >
+                <ZoomOutRegular className="size-5" />
+              </ToolbarIconButton>
+              <button
+                type="button"
+                onClick={() => toggleToolbarMenu('zoom')}
+                className={`flex h-8 min-w-20 items-center justify-center gap-1 rounded-md px-2 text-sm font-semibold transition-colors duration-150 ${
+                  toolbarMenuOpen === 'zoom' ? 'bg-blue-500/15 text-blue-100' : 'text-slate-200 hover:bg-slate-800'
+                }`}
+                title="Zoom options"
+              >
+                {Math.round((splitEnabled && activePane === 'right' ? rightPaneState?.zoom ?? 1 : displayZoom) * 100)}%
+                <ChevronDownRegular className="size-3.5" />
+              </button>
+              <ToolbarIconButton
+                label="Zoom in"
+                title="Zoom in"
+                onClick={() => changeActiveZoom(0.25)}
+                disabled={(splitEnabled && activePane === 'right' ? rightPaneState?.zoom ?? 1 : displayZoom) >= MAX_SCALE}
+              >
+                <ZoomInRegular className="size-5" />
+              </ToolbarIconButton>
+            </div>
+            {toolbarMenuOpen === 'zoom' ? (
+              <ToolbarMenuPanel align="left">
+                {[0.5, 0.75, 1, 1.25, 1.5, 2].map((zoom) => (
+                  <ToolbarMenuItem key={zoom} onClick={() => setActiveZoomPreset(zoom)} icon={<ZoomInRegular className="size-4" />}>
+                    {Math.round(zoom * 100)}%
+                  </ToolbarMenuItem>
+                ))}
+                <div className="my-1 border-t border-slate-700" />
+                <ToolbarMenuItem onClick={() => {
+                  fitActivePane()
+                  closeToolbarMenu()
+                }} icon={<ZoomFitRegular className="size-4" />}>Fit Width</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => setActiveZoomPreset(1)} icon={<DocumentPdfRegular className="size-4" />}>Actual Size</ToolbarMenuItem>
+              </ToolbarMenuPanel>
+            ) : null}
+          </div>
+
+          <FluentToolbarDivider />
+
+          <div className="relative shrink-0">
+            <ToolbarMenuButton
+              active={toolbarMenuOpen === 'annotate'}
+              onClick={() => toggleToolbarMenu('annotate')}
+              icon={<HighlightRegular className="size-5" />}
+            >
+              Annotate
+            </ToolbarMenuButton>
+            {toolbarMenuOpen === 'annotate' ? (
+              <ToolbarMenuPanel align="left">
+                <ToolbarMenuItem onClick={() => {
+                  if (!thumbnailSidebarOpen) void toggleSidebar()
+                  setSidebarTab('highlights')
+                  closeToolbarMenu()
+                }} icon={<HighlightRegular className="size-4" />}>Highlights Panel</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => {
+                  setExportHighlightsOpen(true)
+                  closeToolbarMenu()
+                }} icon={<SaveRegular className="size-4" />}>Export Highlights</ToolbarMenuItem>
+                <ToolbarMenuItem disabled icon={<PenRegular className="size-4" />}>Add Note from selected highlight</ToolbarMenuItem>
+              </ToolbarMenuPanel>
+            ) : null}
+          </div>
+
+          <div className="relative shrink-0">
+            <ToolbarMenuButton
+              active={toolbarMenuOpen === 'fill-sign'}
+              onClick={() => {
+                void prepareSignatureMenu()
+                toggleToolbarMenu('fill-sign')
+              }}
+              icon={<SignatureRegular className="size-5" />}
+            >
+              Fill & Sign
+            </ToolbarMenuButton>
+            {toolbarMenuOpen === 'fill-sign' ? (
+              <ToolbarMenuPanel align="left">
+                <ToolbarMenuItem disabled={!activeSignatureDocument} onClick={() => startFillSignTool('text')} icon={<TextAddTRegular className="size-4" />}>Add Text</ToolbarMenuItem>
+                <ToolbarMenuItem disabled={!activeSignatureDocument} onClick={() => startFillSignTool('date')} icon={<CalendarRegular className="size-4" />}>Add Date</ToolbarMenuItem>
+                <ToolbarMenuItem disabled={!activeSignatureDocument} onClick={() => startFillSignTool('initials')} icon={<TextBulletListSquareRegular className="size-4" />}>Add Initials</ToolbarMenuItem>
+                <ToolbarMenuItem disabled={!activeSignatureDocument} onClick={() => startFillSignTool('checkbox')} icon={<CheckboxCheckedRegular className="size-4" />}>Add Checkbox</ToolbarMenuItem>
+                <div className="my-1 border-t border-slate-700" />
+                {savedSignatures.length ? savedSignatures.slice(0, 5).map((signature) => (
+                  <ToolbarMenuItem key={signature.id} disabled={!activeSignatureDocument} onClick={() => {
+                    chooseSignatureForPlacement(signature)
+                    closeToolbarMenu()
+                  }} icon={<SignatureRegular className="size-4" />} title={signature.name}>
+                    <span className="block max-w-44 truncate">{signature.name}</span>
+                  </ToolbarMenuItem>
+                )) : (
+                  <p className="px-3 py-2 text-xs text-slate-500">No saved signatures</p>
+                )}
+                <ToolbarMenuItem onClick={() => openPdfToolPanel('signatures')} icon={<PenRegular className="size-4" />}>Manage Signatures</ToolbarMenuItem>
+                <div className="my-1 border-t border-slate-700" />
+                <ToolbarMenuItem disabled={!activeSignatureDocument || (activeSignaturePlacements.length === 0 && activeFillSignFields.length === 0) || isSavingSignedCopy} onClick={() => {
+                  closeToolbarMenu()
+                  void saveSignedCopy()
+                }} icon={<SaveRegular className="size-4" />}>Save Signed Copy</ToolbarMenuItem>
+              </ToolbarMenuPanel>
+            ) : null}
+          </div>
+
+          <div className="relative shrink-0">
+            <ToolbarMenuButton
+              active={toolbarMenuOpen === 'research'}
+              onClick={() => toggleToolbarMenu('research')}
+              icon={<BookOpenRegular className="size-5" />}
+            >
+              Research
+            </ToolbarMenuButton>
+            {toolbarMenuOpen === 'research' ? (
+              <ToolbarMenuPanel align="left">
+                <p className="px-3 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">
+                  {workspaceList.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? 'Current Workspace'}
+                </p>
+                <ToolbarMenuItem onClick={() => {
+                  closeToolbarMenu()
+                  void openWorkspaceManager()
+                }} icon={<BookOpenRegular className="size-4" />}>Workspace</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => {
+                  closeToolbarMenu()
+                  openReferences()
+                }} icon={<TextBulletListSquareRegular className="size-4" />}>References</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => {
+                  closeToolbarMenu()
+                  if (globalDashboardOpen) setGlobalDashboardOpen(false)
+                  else void openHighlightLibrary()
+                }} icon={<HighlightRegular className="size-4" />}>Knowledge Base</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => {
+                  closeToolbarMenu()
+                  openGlobalSearch()
+                }} icon={<SearchRegular className="size-4" />}>Global Search</ToolbarMenuItem>
+              </ToolbarMenuPanel>
+            ) : null}
+          </div>
+
+          <div className="relative shrink-0">
+            <ToolbarMenuButton
+              active={toolbarMenuOpen === 'pdf-tools'}
+              onClick={() => toggleToolbarMenu('pdf-tools')}
+              icon={<DocumentPdfRegular className="size-5" />}
+            >
+              PDF Tools
+            </ToolbarMenuButton>
+            {toolbarMenuOpen === 'pdf-tools' ? (
+              <ToolbarMenuPanel align="left">
+                <ToolbarMenuItem onClick={() => openPdfToolPanel('merge')} icon={<DocumentPdfRegular className="size-4" />}>Merge PDFs</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => openPdfToolPanel('images')} icon={<AddRegular className="size-4" />}>Images to PDF</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => openPdfToolPanel('signatures')} icon={<SignatureRegular className="size-4" />}>Signature Manager</ToolbarMenuItem>
+                <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Document Properties</ToolbarMenuItem>
+                <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Repair Missing Files</ToolbarMenuItem>
+              </ToolbarMenuPanel>
+            ) : null}
+          </div>
+
+          <div className="relative shrink-0">
+            <ToolbarMenuButton
+              active={toolbarMenuOpen === 'view'}
+              onClick={() => toggleToolbarMenu('view')}
+              icon={<PanelLeftRegular className="size-5" />}
+            >
+              View
+            </ToolbarMenuButton>
+            {toolbarMenuOpen === 'view' ? (
+              <ToolbarMenuPanel align="left">
+                <ToolbarMenuItem disabled={!pdfDocument} onClick={() => {
+                  toggleViewMode()
+                  closeToolbarMenu()
+                }} icon={<DocumentPdfRegular className="size-4" />}>
+                  {viewMode === 'continuous' ? 'Single Page View' : 'Continuous Scroll'}
+                </ToolbarMenuItem>
+                <ToolbarMenuItem disabled={!pdfDocument} onClick={() => {
+                  rotateActivePane(-90)
+                  closeToolbarMenu()
+                }} icon={<ArrowLeftRegular className="size-4" />}>Rotate Left</ToolbarMenuItem>
+                <ToolbarMenuItem disabled={!pdfDocument} onClick={() => {
+                  rotateActivePane(90)
+                  closeToolbarMenu()
+                }} icon={<ArrowRightRegular className="size-4" />}>Rotate Right</ToolbarMenuItem>
+                <ToolbarMenuItem disabled={!pdfFile} onClick={() => {
+                  void splitCurrentTab()
+                  closeToolbarMenu()
+                }} icon={<SplitHorizontalRegular className="size-4" />}>Split Current Tab</ToolbarMenuItem>
+                <ToolbarMenuItem disabled={!pdfDocument} onClick={() => {
+                  toggleSidebar()
+                  closeToolbarMenu()
+                }} icon={<PanelLeftRegular className="size-4" />}>Toggle Sidebar</ToolbarMenuItem>
+              </ToolbarMenuPanel>
+            ) : null}
+          </div>
+
+          <FluentToolbarDivider />
+
+          <ToolbarIconButton
+            label="Search PDF"
+            title="Search PDF (Ctrl+F)"
+            onClick={openActivePaneSearch}
+            disabled={!activeSignatureDocument}
+            active={(splitEnabled && activePane === 'right' ? rightPaneState?.searchOpen : searchOpen) === true}
+          >
+            <SearchRegular className="size-5" />
+          </ToolbarIconButton>
+          <ToolbarIconButton
+            label="Toggle sidebar"
+            title={thumbnailSidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+            onClick={toggleSidebar}
+            disabled={!pdfDocument || splitEnabled}
+            active={thumbnailSidebarOpen && Boolean(pdfDocument) && !splitEnabled}
+          >
+            <PanelLeftRegular className="size-5" />
+          </ToolbarIconButton>
+
+          <div className="relative shrink-0">
+            <ToolbarIconButton
+              label="Theme"
+              title={`Reading background: ${VIEWER_BACKGROUND_LABELS[viewerBackground]}`}
+              onClick={() => toggleToolbarMenu('theme')}
+              active={toolbarMenuOpen === 'theme'}
+            >
+              <DarkThemeRegular className="size-5" />
+            </ToolbarIconButton>
+            {toolbarMenuOpen === 'theme' ? (
+              <ToolbarMenuPanel align="right">
+                {([
+                  ['dark-gray', 'Dark Gray'],
+                  ['black', 'Black'],
+                  ['light-gray', 'Light Gray'],
+                  ['white', 'White'],
+                ] as Array<[ViewerBackground, string]>).map(([background, label]) => (
+                  <ToolbarMenuItem key={background} onClick={() => {
+                    changeViewerBackground(background)
+                    closeToolbarMenu()
+                  }} icon={<DarkThemeRegular className="size-4" />}>
+                    <span className={viewerBackground === background ? 'font-bold text-blue-100' : ''}>{label}</span>
+                  </ToolbarMenuItem>
+                ))}
+              </ToolbarMenuPanel>
+            ) : null}
+          </div>
+
+          <div className="relative shrink-0">
+            <ToolbarIconButton
+              label="More"
+              title="More commands"
+              onClick={() => toggleToolbarMenu('more')}
+              active={toolbarMenuOpen === 'more'}
+            >
+              <MoreHorizontalRegular className="size-5" />
+            </ToolbarIconButton>
+            {toolbarMenuOpen === 'more' ? (
+              <ToolbarMenuPanel align="right">
+                <ToolbarMenuItem disabled={!(splitEnabled && activePane === 'right' ? rightDocument?.id : activeDocumentId) || isPrinting} onClick={() => {
+                  closeToolbarMenu()
+                  void printCurrentPdf()
+                }} icon={<PrintRegular className="size-4" />}>Print</ToolbarMenuItem>
+                <ToolbarMenuItem disabled={!(splitEnabled && activePane === 'right' ? rightDocument : pdfDocument) || isExporting} onClick={() => {
+                  closeToolbarMenu()
+                  void exportCurrentPage('png')
+                }} icon={<SaveRegular className="size-4" />}>Export Page as PNG</ToolbarMenuItem>
+                <ToolbarMenuItem disabled={!(splitEnabled && activePane === 'right' ? rightDocument : pdfDocument) || isExporting} onClick={() => {
+                  closeToolbarMenu()
+                  void exportCurrentPage('jpeg')
+                }} icon={<SaveRegular className="size-4" />}>Export Page as JPEG</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => {
+                  setShortcutHelpOpen((isOpen) => !isOpen)
+                  closeToolbarMenu()
+                }} icon={<MoreHorizontalRegular className="size-4" />}>Keyboard Shortcuts</ToolbarMenuItem>
+              </ToolbarMenuPanel>
+            ) : null}
+          </div>
+
+          <ToolbarIconButton
+            label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+            title={isFullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen (F11)'}
+            onClick={() => void (isFullscreen ? exitFullscreen() : toggleFullscreen())}
+            active={isFullscreen}
+          >
+            {isFullscreen ? <FullScreenMinimizeRegular className="size-5" /> : <FullScreenMaximizeRegular className="size-5" />}
+          </ToolbarIconButton>
+
+          <div className="ml-auto flex h-10 min-w-0 max-w-72 shrink items-center gap-2 rounded-lg border border-transparent px-2 text-xs text-slate-400 transition-colors duration-200 hover:border-slate-700 hover:bg-slate-800/60">
+            {(splitEnabled && activePane === 'right' ? rightDocument : pdfFile) ? (
+              <>
+                <DocumentPdfRegular className="size-4 shrink-0 text-blue-300" />
+                <span title={splitEnabled && activePane === 'right' ? rightDocument?.name : pdfFile?.name} className="min-w-0 truncate font-medium text-slate-200">
+                  {splitEnabled && activePane === 'right' ? rightDocument?.name : pdfFile?.name}
+                </span>
+                <span aria-hidden="true" className="text-slate-600">•</span>
+                <span className="shrink-0">
+                  {splitEnabled && activePane === 'right'
+                    ? rightViewStatus.totalPages > 0 ? `${rightViewStatus.totalPages} pages` : isLoading ? 'Loading...' : ''
+                    : numPages > 0 ? `${numPages} pages` : isLoading ? 'Loading...' : ''}
+                </span>
+              </>
+            ) : (
+              <span className="shrink-0">No PDF selected</span>
+            )}
+          </div>
+        </div>
+
+        <div className="hidden">
           <button
             type="button"
             onClick={() => void openPdf()}
@@ -7018,6 +7509,152 @@ function isEditableKeyboardTarget(target: EventTarget | null) {
   if (!(target instanceof HTMLElement)) return false
   if (target.isContentEditable) return true
   return ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+}
+
+function ToolbarCommandButton({
+  children,
+  active = false,
+  disabled = false,
+  title,
+  onClick,
+}: {
+  children: React.ReactNode
+  active?: boolean
+  disabled?: boolean
+  title?: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+      className={`flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${
+        active
+          ? 'border-blue-400 bg-blue-500/15 text-blue-100 shadow-[inset_0_1px_0_rgba(96,165,250,0.35)]'
+          : 'border-slate-700/90 bg-slate-900/35 text-slate-200 hover:border-slate-600 hover:bg-slate-800'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+function ToolbarMenuButton({
+  children,
+  icon,
+  active = false,
+  disabled = false,
+  onClick,
+}: {
+  children: React.ReactNode
+  icon: React.ReactNode
+  active?: boolean
+  disabled?: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      aria-expanded={active}
+      disabled={disabled}
+      onClick={onClick}
+      className={`flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${
+        active
+          ? 'border-blue-400 bg-blue-500/15 text-blue-100'
+          : 'border-slate-700/90 bg-slate-900/35 text-slate-300 hover:border-slate-600 hover:bg-slate-800 hover:text-white'
+      }`}
+    >
+      {icon}
+      <span className="hidden whitespace-nowrap xl:inline">{children}</span>
+      <ChevronDownRegular className="size-3.5 shrink-0 opacity-75" />
+    </button>
+  )
+}
+
+function ToolbarIconButton({
+  children,
+  label,
+  title,
+  active = false,
+  disabled = false,
+  onClick,
+}: {
+  children: React.ReactNode
+  label: string
+  title?: string
+  active?: boolean
+  disabled?: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={title ?? label}
+      disabled={disabled}
+      onClick={onClick}
+      className={`grid size-9 shrink-0 place-items-center rounded-md transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${
+        active
+          ? 'bg-blue-500/15 text-blue-100 ring-1 ring-blue-400/50'
+          : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+function ToolbarMenuPanel({
+  children,
+  align = 'left',
+  className = '',
+}: {
+  children: React.ReactNode
+  align?: 'left' | 'right'
+  className?: string
+}) {
+  return (
+    <div
+      role="menu"
+      className={`absolute top-12 z-40 max-h-[70vh] min-w-56 overflow-auto rounded-xl border border-slate-700 bg-slate-900/98 p-1.5 text-slate-100 shadow-2xl shadow-black/50 backdrop-blur ${align === 'right' ? 'right-0' : 'left-0'} ${className}`}
+    >
+      {children}
+    </div>
+  )
+}
+
+function ToolbarMenuItem({
+  children,
+  icon,
+  title,
+  disabled = false,
+  onClick,
+}: {
+  children: React.ReactNode
+  icon?: React.ReactNode
+  title?: string
+  disabled?: boolean
+  onClick?: () => void
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-slate-200 transition-colors duration-150 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:text-slate-600 disabled:hover:bg-transparent"
+    >
+      {icon ? <span className="grid size-5 shrink-0 place-items-center text-slate-400">{icon}</span> : null}
+      <span className="min-w-0 flex-1">{children}</span>
+    </button>
+  )
+}
+
+function FluentToolbarDivider() {
+  return <span aria-hidden="true" className="mx-1 h-6 w-px shrink-0 bg-slate-700/80" />
 }
 
 function TabMenuButton({
