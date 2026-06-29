@@ -5205,7 +5205,7 @@ function App() {
 
       <header
         ref={headerRef}
-        className="sticky top-0 z-50 border-b border-slate-600/90 bg-[#111827]/98 px-3 py-2.5 shadow-lg shadow-slate-950/30 backdrop-blur-2xl sm:px-4"
+        className="sticky top-0 z-50 border-b border-slate-600/90 bg-[#111827] px-3 py-2.5 shadow-lg shadow-slate-950/40 backdrop-blur-2xl sm:px-4"
       >
         <div className="flex w-full flex-wrap items-center gap-1.5 overflow-visible pb-0.5">
           <div data-toolbar-menu-scope="" className="relative shrink-0">
