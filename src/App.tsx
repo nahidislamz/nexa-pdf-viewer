@@ -5176,7 +5176,7 @@ function App() {
 
       <header
         ref={headerRef}
-        className="sticky top-0 z-50 border-b border-slate-700 bg-[#111827]/95 px-3 py-2.5 shadow-lg shadow-slate-950/20 backdrop-blur sm:px-4"
+        className="sticky top-0 z-50 border-b border-slate-600/90 bg-[#111827]/98 px-3 py-2.5 shadow-lg shadow-slate-950/30 backdrop-blur-2xl sm:px-4"
       >
         <div className="flex w-full flex-wrap items-center gap-1.5 overflow-visible pb-0.5">
           <div className="relative shrink-0">
@@ -7618,7 +7618,7 @@ function ToolbarMenuPanel({
   return (
     <div
       role="menu"
-      className={`absolute top-12 z-[80] max-h-[70vh] min-w-56 overflow-auto rounded-xl border border-slate-700 bg-slate-900/98 p-1.5 text-slate-100 shadow-2xl shadow-black/50 backdrop-blur ${align === 'right' ? 'right-0' : 'left-0'} ${className}`}
+      className={`absolute top-12 z-[80] max-h-[70vh] min-w-56 overflow-auto rounded-xl border border-slate-600/90 bg-slate-950/95 p-1.5 text-slate-100 shadow-2xl shadow-black/70 backdrop-blur-2xl ${align === 'right' ? 'right-0' : 'left-0'} ${className}`}
     >
       {children}
     </div>
