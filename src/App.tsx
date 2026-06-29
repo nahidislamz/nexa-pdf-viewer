@@ -863,8 +863,8 @@ function App() {
 
   useEffect(() => {
     function closeToolbarMenuOnOutsideInteraction(event: PointerEvent | FocusEvent) {
-      const target = event.target as Node | null
-      if (target && headerRef.current?.contains(target)) {
+      const target = event.target as HTMLElement | null
+      if (target?.closest('[data-toolbar-menu-scope]')) {
         return
       }
       setToolbarMenuOpen(null)
@@ -875,6 +875,23 @@ function App() {
     return () => {
       document.removeEventListener('pointerdown', closeToolbarMenuOnOutsideInteraction, true)
       document.removeEventListener('focusin', closeToolbarMenuOnOutsideInteraction, true)
+    }
+  }, [])
+
+  useEffect(() => {
+    function closeShortcutHelpOnOutsideInteraction(event: PointerEvent | FocusEvent) {
+      const target = event.target as HTMLElement | null
+      if (target?.closest('[data-shortcut-help-panel]')) {
+        return
+      }
+      setShortcutHelpOpen(false)
+    }
+
+    document.addEventListener('pointerdown', closeShortcutHelpOnOutsideInteraction, true)
+    document.addEventListener('focusin', closeShortcutHelpOnOutsideInteraction, true)
+    return () => {
+      document.removeEventListener('pointerdown', closeShortcutHelpOnOutsideInteraction, true)
+      document.removeEventListener('focusin', closeShortcutHelpOnOutsideInteraction, true)
     }
   }, [])
 
@@ -5179,7 +5196,7 @@ function App() {
         className="sticky top-0 z-50 border-b border-slate-600/90 bg-[#111827]/98 px-3 py-2.5 shadow-lg shadow-slate-950/30 backdrop-blur-2xl sm:px-4"
       >
         <div className="flex w-full flex-wrap items-center gap-1.5 overflow-visible pb-0.5">
-          <div className="relative shrink-0">
+          <div data-toolbar-menu-scope="" className="relative shrink-0">
             <ToolbarCommandButton
               active={toolbarMenuOpen === 'open'}
               onClick={() => toggleToolbarMenu('open')}
@@ -5257,7 +5274,7 @@ function App() {
 
           <FluentToolbarDivider />
 
-          <div className="relative shrink-0">
+          <div data-toolbar-menu-scope="" className="relative shrink-0">
             <div className="flex h-10 items-center gap-1 rounded-lg border border-slate-700/80 bg-slate-900/55 px-1">
               <ToolbarIconButton
                 label="Zoom out"
@@ -5306,7 +5323,7 @@ function App() {
 
           <FluentToolbarDivider />
 
-          <div className="relative shrink-0">
+          <div data-toolbar-menu-scope="" className="relative shrink-0">
             <ToolbarMenuButton
               active={toolbarMenuOpen === 'annotate'}
               onClick={() => toggleToolbarMenu('annotate')}
@@ -5330,7 +5347,7 @@ function App() {
             ) : null}
           </div>
 
-          <div className="relative shrink-0">
+          <div data-toolbar-menu-scope="" className="relative shrink-0">
             <ToolbarMenuButton
               active={toolbarMenuOpen === 'fill-sign'}
               onClick={() => {
@@ -5368,7 +5385,7 @@ function App() {
             ) : null}
           </div>
 
-          <div className="relative shrink-0">
+          <div data-toolbar-menu-scope="" className="relative shrink-0">
             <ToolbarMenuButton
               active={toolbarMenuOpen === 'research'}
               onClick={() => toggleToolbarMenu('research')}
@@ -5402,7 +5419,7 @@ function App() {
             ) : null}
           </div>
 
-          <div className="relative shrink-0">
+          <div data-toolbar-menu-scope="" className="relative shrink-0">
             <ToolbarMenuButton
               active={toolbarMenuOpen === 'pdf-tools'}
               onClick={() => toggleToolbarMenu('pdf-tools')}
@@ -5421,7 +5438,7 @@ function App() {
             ) : null}
           </div>
 
-          <div className="relative shrink-0">
+          <div data-toolbar-menu-scope="" className="relative shrink-0">
             <ToolbarMenuButton
               active={toolbarMenuOpen === 'view'}
               onClick={() => toggleToolbarMenu('view')}
@@ -5478,7 +5495,7 @@ function App() {
             <PanelLeftRegular className="size-5" />
           </ToolbarIconButton>
 
-          <div className="relative shrink-0">
+          <div data-toolbar-menu-scope="" className="relative shrink-0">
             <ToolbarIconButton
               label="Theme"
               title={`Reading background: ${VIEWER_BACKGROUND_LABELS[viewerBackground]}`}
@@ -5506,7 +5523,7 @@ function App() {
             ) : null}
           </div>
 
-          <div className="relative shrink-0">
+          <div data-toolbar-menu-scope="" className="relative shrink-0">
             <ToolbarIconButton
               label="More"
               title="More commands"
@@ -6353,7 +6370,7 @@ function App() {
         </div>
 
         {shortcutHelpOpen ? (
-          <div className="absolute right-5 top-full z-30 mt-2 w-80 rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl shadow-black/50">
+          <div data-shortcut-help-panel="" className="absolute right-5 top-full z-30 mt-2 w-80 rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl shadow-black/50">
             <div className="mb-3 flex items-center justify-between">
               <h2 className="text-sm font-semibold text-slate-100">Keyboard Shortcuts</h2>
               <button
