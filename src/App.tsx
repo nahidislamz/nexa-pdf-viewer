@@ -5208,6 +5208,17 @@ function App() {
     closeToolbarMenu()
   }
 
+  function showOcrPlaceholder() {
+    closeToolbarMenu()
+    setErrorMessage(null)
+    setLoadingProgress(
+      ocrDetection.status === 'ocr-recommended'
+        ? 'OCR is recommended for this scanned PDF. OCR processing is coming soon.'
+        : 'OCR processing is coming soon.',
+    )
+    window.setTimeout(() => setLoadingProgress(null), 2600)
+  }
+
   function startFillSignTool(tool: FillSignTool) {
     activateFillSignTool(tool)
     closeToolbarMenu()
@@ -5907,7 +5918,14 @@ function App() {
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('merge')} icon={<DocumentPdfRegular className="size-4" />}>Merge PDFs</ToolbarMenuItem>
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('images')} icon={<AddRegular className="size-4" />}>Images to PDF</ToolbarMenuItem>
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('signatures')} icon={<SignatureRegular className="size-4" />}>Signature Manager</ToolbarMenuItem>
-                <ToolbarMenuItem disabled icon={<DocumentBulletListRegular className="size-4" />}>OCR (Coming Soon)</ToolbarMenuItem>
+                <ToolbarMenuItem
+                  onClick={showOcrPlaceholder}
+                  icon={<DocumentBulletListRegular className="size-4" />}
+                >
+                  {ocrDetection.status === 'ocr-recommended'
+                    ? 'OCR Recommended (Coming Soon)'
+                    : 'OCR (Coming Soon)'}
+                </ToolbarMenuItem>
                 <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Document Properties</ToolbarMenuItem>
                 <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Repair Missing Files</ToolbarMenuItem>
               </ToolbarMenuPanel>
