@@ -80,6 +80,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   exportReferences: (options) => ipcRenderer.invoke('references:export', options),
   revealPdf: (id) => ipcRenderer.invoke('pdf:reveal', id),
   savePdfState: (id, state) => ipcRenderer.invoke('pdf:save-state', id, state),
+  saveOcrDetection: (id, detection) => ipcRenderer.invoke('pdf:save-ocr-detection', id, detection),
   savePdfHighlights: (identity, highlights) =>
     ipcRenderer.invoke('pdf:save-highlights', identity, highlights),
   savePdfSignaturePlacements: (identity, placements) =>

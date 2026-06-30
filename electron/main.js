@@ -652,6 +652,19 @@ function sanitizePdfOpenDestination(destination) {
     : 'ask'
 }
 
+function sanitizeOcrDetection(detection) {
+  const status = ['unknown', 'detecting', 'searchable', 'ocr-recommended', 'error'].includes(detection?.status)
+    ? detection.status
+    : 'unknown'
+  return {
+    status,
+    sampledPages: Math.max(0, Math.min(10, Math.trunc(Number(detection?.sampledPages) || 0))),
+    textCharacters: Math.max(0, Math.trunc(Number(detection?.textCharacters) || 0)),
+    detectedAt: detection?.detectedAt ? validIsoDate(detection.detectedAt) : null,
+    error: typeof detection?.error === 'string' ? detection.error.slice(0, 500) : '',
+  }
+}
+
 function validIsoDate(value) {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? null : date.toISOString()
@@ -1780,6 +1793,11 @@ async function loadPdf(filePath) {
   const modifiedAt = fileStats.mtimeMs
 
   return withStore(async (store) => {
+    const existingRecord = store.documentRegistry[id] ?? store.recentFiles.find((item) => item.id === id)
+    const ocrDetection =
+      existingRecord?.fileSize === buffer.byteLength && existingRecord?.modifiedAt === modifiedAt
+        ? sanitizeOcrDetection(existingRecord.ocrDetection)
+        : sanitizeOcrDetection(null)
     const documentRecord = {
       id,
       name,
@@ -1788,6 +1806,7 @@ async function loadPdf(filePath) {
       modifiedAt,
       openedAt: Date.now(),
       missing: false,
+      ocrDetection,
     }
     store.documentRegistry[id] = documentRecord
     ensureReferenceForDocument(store, documentRecord)
@@ -1809,6 +1828,7 @@ async function loadPdf(filePath) {
       highlights: getStoredHighlights(store, filePath, buffer.byteLength, modifiedAt),
       signaturePlacements: getStoredSignaturePlacements(store, filePath, buffer.byteLength, modifiedAt),
       fillSignFields: getStoredFillSignFields(store, filePath, buffer.byteLength, modifiedAt),
+      ocrDetection: documentRecord.ocrDetection,
     }
   })
 }
@@ -2706,10 +2726,15 @@ ipcMain.handle('pdf:open-recent', (_event, id) =>
         fs.readFile(recentFile.path),
         fs.stat(recentFile.path),
       ])
+      const ocrDetection =
+        recentFile.fileSize === buffer.byteLength && recentFile.modifiedAt === fileStats.mtimeMs
+          ? sanitizeOcrDetection(recentFile.ocrDetection)
+          : sanitizeOcrDetection(null)
       recentFile.fileSize = buffer.byteLength
       recentFile.modifiedAt = fileStats.mtimeMs
       recentFile.openedAt = Date.now()
       recentFile.missing = false
+      recentFile.ocrDetection = ocrDetection
       store.documentRegistry[id] = recentFile
       ensureReferenceForDocument(store, recentFile)
       store.recentFiles = [
@@ -2745,6 +2770,7 @@ ipcMain.handle('pdf:open-recent', (_event, id) =>
           buffer.byteLength,
           fileStats.mtimeMs,
         ),
+        ocrDetection,
       }
     } catch (error) {
       if (error.code === 'ENOENT') {
@@ -3447,6 +3473,27 @@ ipcMain.handle('pdf:save-state', (_event, id, state) =>
     console.debug('Saved page:', readingState.page)
     store.documentStates[id] = readingState
     await saveStore(store)
+  }),
+)
+
+ipcMain.handle('pdf:save-ocr-detection', (_event, id, detection) =>
+  withStore(async (store) => {
+    const recentFile = store.documentRegistry[id] ?? store.recentFiles.find((item) => item.id === id)
+    if (!recentFile) {
+      throw new Error('The PDF is no longer available.')
+    }
+
+    const sanitizedDetection = sanitizeOcrDetection(detection)
+    const updatedRecord = {
+      ...recentFile,
+      ocrDetection: sanitizedDetection,
+    }
+    store.documentRegistry[id] = updatedRecord
+    store.recentFiles = store.recentFiles.map((item) =>
+      item.id === id ? { ...item, ocrDetection: sanitizedDetection } : item,
+    )
+    await saveStore(store)
+    return sanitizedDetection
   }),
 )
 

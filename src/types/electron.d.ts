@@ -22,6 +22,16 @@ type PdfReadingState = {
   rotation: number
 }
 
+type OcrDetectionStatus = 'unknown' | 'detecting' | 'searchable' | 'ocr-recommended' | 'error'
+
+type OcrDetectionResult = {
+  status: OcrDetectionStatus
+  sampledPages: number
+  textCharacters: number
+  detectedAt: string | null
+  error?: string
+}
+
 type OpenedPdf = {
   id: string
   name: string
@@ -33,6 +43,7 @@ type OpenedPdf = {
   highlights: PdfHighlight[]
   signaturePlacements: SignaturePlacement[]
   fillSignFields: FillSignField[]
+  ocrDetection: OcrDetectionResult
 }
 
 type MergePdfItem = {
@@ -296,6 +307,7 @@ declare global {
       exportReferences: (options: { referenceIds?: string[]; workspaceId?: string; request?: { query: string; filters: ReferenceFilters; sort: 'newest' | 'oldest' | 'title' | 'author' }; style: CitationStyle; format: 'text' | 'markdown' | 'docx' | 'bibtex' | 'ris' }) => Promise<string | null>
       revealPdf: (id: string) => Promise<void>
       savePdfState: (id: string, state: PdfReadingState) => Promise<void>
+      saveOcrDetection: (id: string, detection: OcrDetectionResult) => Promise<OcrDetectionResult>
       savePdfHighlights: (
         identity: { id: string; fileSize: number; modifiedAt: number },
         highlights: PdfHighlight[],

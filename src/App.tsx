@@ -111,6 +111,7 @@ type OpenedPdf = PdfFile & {
   highlights: PdfHighlight[]
   signaturePlacements: SignaturePlacement[]
   fillSignFields: FillSignField[]
+  ocrDetection: OcrDetectionResult
 }
 
 type SystemPdfOpenMessage =
@@ -213,6 +214,16 @@ type DocumentMetadata = {
   modificationDate: string
 }
 
+type OcrDetectionStatus = 'unknown' | 'detecting' | 'searchable' | 'ocr-recommended' | 'error'
+
+type OcrDetectionResult = {
+  status: OcrDetectionStatus
+  sampledPages: number
+  textCharacters: number
+  detectedAt: string | null
+  error?: string
+}
+
 type SearchProgress = {
   processed: number
   total: number
@@ -224,6 +235,14 @@ const ZOOM_RENDER_DEBOUNCE_MS = 120
 const PAGE_RENDER_OVERSCAN = 1
 const DEFAULT_PAGE_WIDTH = 612
 const DEFAULT_PAGE_HEIGHT = 792
+const OCR_SAMPLE_PAGES = 3
+const OCR_SEARCHABLE_CHARACTER_THRESHOLD = 80
+const EMPTY_OCR_DETECTION: OcrDetectionResult = {
+  status: 'unknown',
+  sampledPages: 0,
+  textCharacters: 0,
+  detectedAt: null,
+}
 const VIEWER_BACKGROUNDS: Record<ViewerBackground, string> = {
   'dark-gray': '#1f2937',
   black: '#000000',
@@ -380,6 +399,7 @@ function App() {
   const [outlineLoading, setOutlineLoading] = useState(false)
   const [documentMetadata, setDocumentMetadata] = useState<DocumentMetadata | null>(null)
   const [metadataLoading, setMetadataLoading] = useState(false)
+  const [ocrDetection, setOcrDetection] = useState<OcrDetectionResult>(EMPTY_OCR_DETECTION)
   const [highlights, setHighlights] = useState<PdfHighlight[]>([])
   const [signaturePlacements, setSignaturePlacements] = useState<SignaturePlacement[]>([])
   const [fillSignFields, setFillSignFields] = useState<FillSignField[]>([])
@@ -462,6 +482,7 @@ function App() {
   const thumbnailListRef = useRef<HTMLDivElement>(null)
   const outlineGenerationRef = useRef(0)
   const metadataGenerationRef = useRef(0)
+  const ocrDetectionGenerationRef = useRef(0)
   const firstPageProxyRef = useRef<PDFPageProxy | null>(null)
   const pdfDocumentRef = useRef<PDFDocumentProxy | null>(null)
   const navigationTargetRef = useRef<number | null>(null)
@@ -3161,12 +3182,81 @@ function App() {
     }
   }
 
+  async function detectOcrStatus(document: PDFDocumentProxy, file: PdfFile) {
+    const currentDetection = normalizeOcrDetection(ocrDetection)
+    if (
+      pdfFile?.id === file.id &&
+      (currentDetection.status === 'searchable' || currentDetection.status === 'ocr-recommended')
+    ) {
+      return
+    }
+
+    const generation = ++ocrDetectionGenerationRef.current
+    const started = performance.now()
+    const detecting: OcrDetectionResult = {
+      ...EMPTY_OCR_DETECTION,
+      status: 'detecting',
+    }
+    setOcrDetection(detecting)
+
+    try {
+      const sampledPages = Math.min(OCR_SAMPLE_PAGES, document.numPages)
+      let textCharacters = 0
+
+      for (let pageNumber = 1; pageNumber <= sampledPages; pageNumber += 1) {
+        const pageText = await getPageText(document, pageNumber, pageTextCacheRef.current)
+        textCharacters += countMeaningfulTextCharacters(pageText.text)
+        await yieldToMainThread()
+      }
+
+      const detection: OcrDetectionResult = {
+        status:
+          textCharacters >= OCR_SEARCHABLE_CHARACTER_THRESHOLD
+            ? 'searchable'
+            : 'ocr-recommended',
+        sampledPages,
+        textCharacters,
+        detectedAt: new Date().toISOString(),
+      }
+      console.info(
+        `OCR detection time: ${formatDuration(performance.now() - started)} (${ocrDetectionLabel(detection)})`,
+      )
+      if (ocrDetectionGenerationRef.current === generation && pdfFile?.id === file.id) {
+        setOcrDetection(detection)
+      }
+      const savedDetection = await window.electronAPI.saveOcrDetection(file.id, detection)
+      if (ocrDetectionGenerationRef.current === generation && pdfFile?.id === file.id) {
+        setOcrDetection(normalizeOcrDetection(savedDetection))
+      }
+    } catch (error) {
+      const detection: OcrDetectionResult = {
+        status: 'error',
+        sampledPages: 0,
+        textCharacters: 0,
+        detectedAt: new Date().toISOString(),
+        error: getErrorMessage(error),
+      }
+      if (ocrDetectionGenerationRef.current === generation && pdfFile?.id === file.id) {
+        setOcrDetection(detection)
+      }
+      try {
+        await window.electronAPI.saveOcrDetection(file.id, detection)
+      } catch (saveError) {
+        console.warn('OCR detection save failed:', getErrorMessage(saveError))
+      }
+    }
+  }
+
   function scheduleBackgroundDocumentWork(document: PDFDocumentProxy) {
     window.clearTimeout(backgroundDocumentTaskRef.current)
+    const sourceFile = pdfFile
     backgroundDocumentTaskRef.current = window.setTimeout(() => {
       void loadPdfOutline(document)
       void loadDocumentMetadata(document)
-      if (pdfFile) void extractAndStoreReference(document, pdfFile).catch((error) => console.warn('Reference extraction failed:', getErrorMessage(error)))
+      if (sourceFile) {
+        void detectOcrStatus(document, sourceFile)
+        void extractAndStoreReference(document, sourceFile).catch((error) => console.warn('Reference extraction failed:', getErrorMessage(error)))
+      }
       void startGlobalSearchIndexing(document)
     }, 250)
   }
@@ -4503,6 +4593,8 @@ function App() {
     setSignPickerOpen(false)
     setOutline([])
     setDocumentMetadata(null)
+    ocrDetectionGenerationRef.current += 1
+    setOcrDetection(EMPTY_OCR_DETECTION)
     setIsLoading(false)
     setLoadingProgress(null)
     setIsRestoring(false)
@@ -4787,10 +4879,12 @@ function App() {
     pageTextCacheRef.current.clear()
     outlineGenerationRef.current += 1
     metadataGenerationRef.current += 1
+    ocrDetectionGenerationRef.current += 1
     setOutline([])
     setOutlineLoading(false)
     setDocumentMetadata(null)
     setMetadataLoading(false)
+    setOcrDetection(normalizeOcrDetection(result.ocrDetection))
     highlightSaveGenerationRef.current += 1
     signaturePlacementSaveGenerationRef.current += 1
     fillSignSaveGenerationRef.current += 1
@@ -5813,6 +5907,7 @@ function App() {
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('merge')} icon={<DocumentPdfRegular className="size-4" />}>Merge PDFs</ToolbarMenuItem>
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('images')} icon={<AddRegular className="size-4" />}>Images to PDF</ToolbarMenuItem>
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('signatures')} icon={<SignatureRegular className="size-4" />}>Signature Manager</ToolbarMenuItem>
+                <ToolbarMenuItem disabled icon={<DocumentBulletListRegular className="size-4" />}>OCR (Coming Soon)</ToolbarMenuItem>
                 <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Document Properties</ToolbarMenuItem>
                 <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Repair Missing Files</ToolbarMenuItem>
               </ToolbarMenuPanel>
@@ -7209,6 +7304,7 @@ function App() {
                   totalPages={numPages}
                   metadata={documentMetadata}
                   loading={metadataLoading}
+                  ocrDetection={ocrDetection}
                 />
               ) : null}
 
@@ -7695,6 +7791,12 @@ function App() {
             )}
             <StatusDivider />
             <StatusItem>{VIEWER_BACKGROUND_LABELS[viewerBackground]}</StatusItem>
+            {(!splitEnabled || activePane === 'left') && pdfFile ? (
+              <>
+                <StatusDivider />
+                <StatusItem>{ocrDetectionLabel(ocrDetection)}</StatusItem>
+              </>
+            ) : null}
             {(splitEnabled && activePane === 'right' ? rightPaneState?.searchOpen : searchOpen) ? (
               <>
                 <StatusDivider />
@@ -8450,17 +8552,20 @@ function DocumentInfoPanel({
   totalPages,
   metadata,
   loading,
+  ocrDetection,
 }: {
   file: PdfFile
   totalPages: number
   metadata: DocumentMetadata | null
   loading: boolean
+  ocrDetection: OcrDetectionResult
 }) {
   const rows = [
     ['File name', file.name],
     ['File path', file.filePath],
     ['File size', formatFileSize(file.fileSize)],
     ['Total pages', String(totalPages)],
+    ['OCR status', ocrDetectionLabel(ocrDetection)],
     ['Title', metadata?.title],
     ['Author', metadata?.author],
     ['Subject', metadata?.subject],
@@ -8993,6 +9098,44 @@ function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality?: num
       quality,
     )
   })
+}
+
+function normalizeOcrDetection(detection: Partial<OcrDetectionResult> | null | undefined): OcrDetectionResult {
+  const status: OcrDetectionStatus = [
+    'unknown',
+    'detecting',
+    'searchable',
+    'ocr-recommended',
+    'error',
+  ].includes(detection?.status ?? '')
+    ? (detection?.status as OcrDetectionStatus)
+    : 'unknown'
+  return {
+    status,
+    sampledPages: Math.max(0, Math.trunc(Number(detection?.sampledPages) || 0)),
+    textCharacters: Math.max(0, Math.trunc(Number(detection?.textCharacters) || 0)),
+    detectedAt: detection?.detectedAt ?? null,
+    error: detection?.error,
+  }
+}
+
+function ocrDetectionLabel(detection: Partial<OcrDetectionResult> | null | undefined) {
+  switch (detection?.status) {
+    case 'searchable':
+      return 'Searchable PDF'
+    case 'ocr-recommended':
+      return 'Scanned PDF - OCR Recommended'
+    case 'detecting':
+      return 'Detecting OCR status...'
+    case 'error':
+      return 'OCR detection unavailable'
+    default:
+      return 'OCR status unknown'
+  }
+}
+
+function countMeaningfulTextCharacters(text: string) {
+  return Array.from(text.replace(/\s+/g, '')).filter((character) => /[\p{L}\p{N}]/u.test(character)).length
 }
 
 async function getPageText(
