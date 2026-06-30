@@ -17,6 +17,7 @@ import {
   ChevronRightRegular,
   CollectionsRegular,
   DarkThemeRegular,
+  DismissRegular,
   DocumentBulletListRegular,
   DocumentOnePageRegular,
   DocumentPdfRegular,
@@ -148,6 +149,21 @@ type ToolbarMenu =
   | 'theme'
   | 'view'
   | 'more'
+type PdfOpenDestinationPreference = 'ask' | 'individual' | 'current-workspace' | 'choose-workspace'
+type PdfOpenDestinationChoice = 'individual' | 'current-workspace' | 'another-workspace' | 'new-workspace'
+type PdfOpenDestinationDecision = {
+  choice: PdfOpenDestinationChoice
+  workspaceId?: string
+  workspaceName?: string
+}
+type PdfOpenDestinationPrompt = {
+  document: { id: string; name: string }
+  initialChoice: PdfOpenDestinationChoice
+  remember: boolean
+  workspaceId: string
+  workspaceName: string
+  resolve: (decision: PdfOpenDestinationDecision | null) => void
+}
 type WorkspaceSession = Awaited<ReturnType<Window['electronAPI']['getWorkspace']>>
 type WorkspaceNavigationOptions = { highlight?: HighlightLibraryEntry; workspaceId?: string }
 
@@ -406,6 +422,12 @@ function App() {
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
   const [pdfToolsMenuOpen, setPdfToolsMenuOpen] = useState(false)
   const [toolbarMenuOpen, setToolbarMenuOpen] = useState<ToolbarMenu | null>(null)
+  const [pdfOpenDestination, setPdfOpenDestination] =
+    useState<PdfOpenDestinationPreference>('ask')
+  const [pdfOpenDestinationPrompt, setPdfOpenDestinationPrompt] =
+    useState<PdfOpenDestinationPrompt | null>(null)
+  const [openingSettingsOpen, setOpeningSettingsOpen] = useState(false)
+  const [clearRecentConfirmOpen, setClearRecentConfirmOpen] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [viewMode, setViewMode] = useState<ViewMode>('continuous')
   const [viewerBackground, setViewerBackground] = useState<ViewerBackground>('dark-gray')
@@ -629,8 +651,7 @@ function App() {
       return
     }
 
-    openResultInTab(message.pdf)
-    void refreshRecentFiles()
+    void openPreparedPdf(message.pdf)
   })
   const restoreWorkspaceEvent = useEffectEvent(restoreWorkspace)
   const getCurrentTabStateEvent = useEffectEvent(getCurrentTabState)
@@ -708,6 +729,10 @@ function App() {
     void window.electronAPI
       .getViewerBackground()
       .then(setViewerBackground)
+      .catch((error) => setErrorMessage(getErrorMessage(error)))
+    void window.electronAPI
+      .getPdfOpenDestination()
+      .then(setPdfOpenDestination)
       .catch((error) => setErrorMessage(getErrorMessage(error)))
   }, [])
 
@@ -4352,6 +4377,108 @@ function App() {
     }
   }
 
+  function destinationPreferenceToChoice(
+    preference: PdfOpenDestinationPreference,
+  ): PdfOpenDestinationChoice | null {
+    if (preference === 'individual') return 'individual'
+    if (preference === 'current-workspace') return 'current-workspace'
+    if (preference === 'choose-workspace') return 'another-workspace'
+    return null
+  }
+
+  function choiceToDestinationPreference(
+    choice: PdfOpenDestinationChoice,
+  ): PdfOpenDestinationPreference {
+    if (choice === 'individual') return 'individual'
+    if (choice === 'current-workspace') return 'current-workspace'
+    return 'choose-workspace'
+  }
+
+  function requestPdfOpenDestination(
+    document: { id: string; name: string },
+  ): Promise<PdfOpenDestinationDecision | null> {
+    const silentChoice = destinationPreferenceToChoice(pdfOpenDestination)
+    if (silentChoice && silentChoice !== 'another-workspace') {
+      return Promise.resolve({ choice: silentChoice })
+    }
+
+    const initialChoice = silentChoice ?? 'individual'
+    return new Promise((resolve) => {
+      setPdfOpenDestinationPrompt({
+        document,
+        initialChoice,
+        remember: false,
+        workspaceId: activeWorkspaceId || workspaceList[0]?.id || '',
+        workspaceName: '',
+        resolve,
+      })
+    })
+  }
+
+  async function setDefaultPdfDestination(destination: PdfOpenDestinationPreference) {
+    const saved = await window.electronAPI.setPdfOpenDestination(destination)
+    setPdfOpenDestination(saved)
+  }
+
+  async function applyPdfOpenDestination(
+    decision: PdfOpenDestinationDecision,
+    document: { id: string; name: string },
+  ) {
+    if (decision.choice === 'individual') {
+      return
+    }
+
+    if (decision.choice === 'current-workspace') {
+      if (!activeWorkspaceId) throw new Error('No workspace active.')
+      await window.electronAPI.addWorkspaceDocument(activeWorkspaceId, document.id)
+      await refreshWorkspaceManager(activeWorkspaceId)
+      return
+    }
+
+    if (decision.choice === 'another-workspace') {
+      if (!decision.workspaceId) throw new Error('Choose a workspace.')
+      await window.electronAPI.addWorkspaceDocument(decision.workspaceId, document.id)
+      await refreshWorkspaceManager(decision.workspaceId)
+      return
+    }
+
+    const name = decision.workspaceName?.trim()
+    if (!name) throw new Error('Workspace name is required.')
+    const workspace = await window.electronAPI.createWorkspace({
+      name,
+      description: '',
+      color: '#3b82f6',
+      icon: 'folder',
+      template: 'blank',
+    })
+    const switched = await window.electronAPI.switchWorkspace(workspace.id, getWorkspaceSnapshot())
+    setActiveWorkspaceId(switched.workspace.id)
+    await applyWorkspaceSession(switched.session)
+    await window.electronAPI.addWorkspaceDocument(workspace.id, document.id)
+    await refreshWorkspaceManager(workspace.id)
+  }
+
+  async function openPreparedPdf(
+    result: OpenedPdf,
+    targetPane: PaneSide = splitEnabled ? activePane : 'left',
+  ) {
+    const decision = await requestPdfOpenDestination({ id: result.id, name: result.name })
+    if (!decision) {
+      setIsLoading(false)
+      setLoadingProgress(null)
+      return
+    }
+
+    if (decision.choice === 'new-workspace') {
+      await applyPdfOpenDestination(decision, result)
+      openResultInTab(result, { targetPane: 'left' })
+    } else {
+      openResultInTab(result, { targetPane })
+      await applyPdfOpenDestination(decision, result)
+    }
+    await refreshRecentFiles()
+  }
+
   function clearViewer() {
     tabSwitchGenerationRef.current += 1
     pdfDocumentRef.current = null
@@ -4398,8 +4525,7 @@ function App() {
         return
       }
 
-      openResultInTab(result, { targetPane })
-      await refreshRecentFiles()
+      await openPreparedPdf(result, targetPane)
     } catch (error) {
       setIsLoading(false)
       setLoadingProgress(null)
@@ -4417,8 +4543,7 @@ function App() {
 
     try {
       const result = await window.electronAPI.openDroppedPdf(file)
-      openResultInTab(result, { targetPane })
-      await refreshRecentFiles()
+      await openPreparedPdf(result, targetPane)
     } catch (error) {
       setIsLoading(false)
       setLoadingProgress(null)
@@ -4562,13 +4687,37 @@ function App() {
     targetPane: PaneSide = splitEnabled ? activePane : 'left',
   ) {
     const existingTab = tabsRef.current.find((tab) => tab.documentId === id)
+    const knownDocument = existingTab
+      ? { id: existingTab.documentId, name: existingTab.name }
+      : recentFiles.find((item) => item.id === id)
+    const decision = knownDocument ? await requestPdfOpenDestination(knownDocument) : null
+    if (knownDocument && !decision) return
+    if (knownDocument && decision?.choice === 'new-workspace') {
+      setErrorMessage(null)
+      setIsLoading(true)
+      setLoadingProgress('Reading PDF file...')
+      try {
+        await applyPdfOpenDestination(decision, knownDocument)
+        const result = await loadDocumentOnce(id)
+        openResultInTab(result, { targetPane: 'left' })
+        await refreshRecentFiles()
+      } catch (error) {
+        setIsLoading(false)
+        setLoadingProgress(null)
+        setErrorMessage(getErrorMessage(error))
+      }
+      return
+    }
+
     if (rightPaneAssignmentRef.current.documentId === id && rightDocument?.id === id) {
       setWorkspaceManagerOpen(false)
+      if (decision && knownDocument) await applyPdfOpenDestination(decision, knownDocument)
       focusPane('right')
       return
     }
     if (leftPaneAssignmentRef.current.documentId === id && pdfFile?.id === id) {
       setWorkspaceManagerOpen(false)
+      if (decision && knownDocument) await applyPdfOpenDestination(decision, knownDocument)
       focusPane('left')
       return
     }
@@ -4579,6 +4728,7 @@ function App() {
       } else {
         await activateTab(existingTab.tabId)
       }
+      if (decision && knownDocument) await applyPdfOpenDestination(decision, knownDocument)
       return
     }
 
@@ -4590,7 +4740,17 @@ function App() {
     let handedToViewer = false
     try {
       const result = await loadDocumentOnce(id)
-      openResultInTab(result, { targetPane })
+      if (decision) {
+        if (decision.choice === 'new-workspace') {
+          await applyPdfOpenDestination(decision, result)
+          openResultInTab(result, { targetPane: 'left' })
+        } else {
+          openResultInTab(result, { targetPane })
+          await applyPdfOpenDestination(decision, result)
+        }
+      } else {
+        await openPreparedPdf(result, targetPane)
+      }
       handedToViewer = true
       await refreshRecentFiles()
     } catch (error) {
@@ -4697,6 +4857,24 @@ function App() {
       setRecentFiles(await window.electronAPI.getRecentPdfs())
     } catch (error) {
       setErrorMessage(getErrorMessage(error))
+    }
+  }
+
+  async function clearRecentFiles() {
+    try {
+      await window.electronAPI.clearRecentPdfs()
+      setRecentFiles([])
+      setClearRecentConfirmOpen(false)
+    } catch (error) {
+      setErrorMessage(`Could not clear recent files: ${getErrorMessage(error)}`)
+    }
+  }
+
+  async function removeRecentFile(id: string) {
+    try {
+      setRecentFiles(await window.electronAPI.removeRecentPdf(id))
+    } catch (error) {
+      setErrorMessage(`Could not remove recent file: ${getErrorMessage(error)}`)
     }
   }
 
@@ -5203,6 +5381,175 @@ function App() {
         </div>
       ) : null}
 
+      {pdfOpenDestinationPrompt ? (
+        <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/75 p-4 backdrop-blur-sm">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="pdf-open-destination-title"
+            className="w-full max-w-xl rounded-2xl border border-slate-600 bg-slate-900 p-5 shadow-2xl shadow-black/70"
+          >
+            <div className="mb-4">
+              <h2 id="pdf-open-destination-title" className="text-lg font-semibold text-white">
+                Open PDF
+              </h2>
+              <p className="mt-1 truncate text-sm text-slate-400" title={pdfOpenDestinationPrompt.document.name}>
+                {pdfOpenDestinationPrompt.document.name}
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              {([
+                ['individual', 'Open individually', 'Do not add this PDF to any workspace.'],
+                ['current-workspace', 'Open in current workspace', activeWorkspaceId ? `Add to ${workspaceList.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? 'current workspace'}.` : 'No workspace active.'],
+                ['another-workspace', 'Open in another workspace', 'Choose an existing workspace.'],
+                ['new-workspace', 'Create new workspace and open', 'Create a workspace, make it active, and add this PDF.'],
+              ] as Array<[PdfOpenDestinationChoice, string, string]>).map(([choice, label, description]) => (
+                <label
+                  key={choice}
+                  className={`flex cursor-pointer gap-3 rounded-xl border px-3 py-3 transition-colors duration-150 ${
+                    pdfOpenDestinationPrompt.initialChoice === choice
+                      ? 'border-blue-400 bg-blue-500/15 text-blue-100'
+                      : 'border-slate-700 bg-slate-950/40 text-slate-300 hover:border-slate-600 hover:bg-slate-800/70'
+                  } ${choice === 'current-workspace' && !activeWorkspaceId ? 'cursor-not-allowed opacity-50' : ''}`}
+                >
+                  <input
+                    type="radio"
+                    name="pdf-open-destination"
+                    value={choice}
+                    checked={pdfOpenDestinationPrompt.initialChoice === choice}
+                    disabled={choice === 'current-workspace' && !activeWorkspaceId}
+                    onChange={() => setPdfOpenDestinationPrompt((current) => current ? { ...current, initialChoice: choice } : current)}
+                    className="mt-1"
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-semibold">{label}</span>
+                    <span className="mt-0.5 block text-xs text-slate-400">{description}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+
+            {pdfOpenDestinationPrompt.initialChoice === 'another-workspace' ? (
+              <label className="mt-4 block text-sm text-slate-300">
+                <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">Workspace</span>
+                <select
+                  value={pdfOpenDestinationPrompt.workspaceId}
+                  onChange={(event) => setPdfOpenDestinationPrompt((current) => current ? { ...current, workspaceId: event.target.value } : current)}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-blue-400"
+                >
+                  {workspaceList.map((workspace) => (
+                    <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+
+            {pdfOpenDestinationPrompt.initialChoice === 'new-workspace' ? (
+              <label className="mt-4 block text-sm text-slate-300">
+                <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">Workspace name</span>
+                <input
+                  value={pdfOpenDestinationPrompt.workspaceName}
+                  onChange={(event) => setPdfOpenDestinationPrompt((current) => current ? { ...current, workspaceName: event.target.value } : current)}
+                  placeholder="New workspace name"
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none placeholder:text-slate-500 focus:border-blue-400"
+                />
+              </label>
+            ) : null}
+
+            <label className="mt-4 flex items-center gap-2 text-sm text-slate-300">
+              <input
+                type="checkbox"
+                checked={pdfOpenDestinationPrompt.remember}
+                onChange={(event) => setPdfOpenDestinationPrompt((current) => current ? { ...current, remember: event.target.checked } : current)}
+              />
+              Remember this choice
+            </label>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  pdfOpenDestinationPrompt.resolve(null)
+                  setPdfOpenDestinationPrompt(null)
+                }}
+                className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-300 hover:bg-slate-800"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const prompt = pdfOpenDestinationPrompt
+                  const decision: PdfOpenDestinationDecision = {
+                    choice: prompt.initialChoice,
+                    workspaceId: prompt.workspaceId,
+                    workspaceName: prompt.workspaceName,
+                  }
+                  if (prompt.remember) {
+                    void setDefaultPdfDestination(choiceToDestinationPreference(prompt.initialChoice))
+                  }
+                  prompt.resolve(decision)
+                  setPdfOpenDestinationPrompt(null)
+                }}
+                disabled={
+                  (pdfOpenDestinationPrompt.initialChoice === 'another-workspace' && !pdfOpenDestinationPrompt.workspaceId) ||
+                  (pdfOpenDestinationPrompt.initialChoice === 'new-workspace' && !pdfOpenDestinationPrompt.workspaceName.trim())
+                }
+                className="rounded-lg bg-blue-500 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-400 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Open
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {openingSettingsOpen ? (
+        <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/70 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-slate-600 bg-slate-900 p-5 shadow-2xl shadow-black/70">
+            <h2 className="text-lg font-semibold text-white">Opening Settings</h2>
+            <label className="mt-4 block text-sm text-slate-300">
+              <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">Default PDF opening destination</span>
+              <select
+                value={pdfOpenDestination}
+                onChange={(event) => void setDefaultPdfDestination(event.target.value as PdfOpenDestinationPreference)}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-blue-400"
+              >
+                <option value="ask">Ask every time</option>
+                <option value="individual">Open individually</option>
+                <option value="current-workspace">Open in current workspace</option>
+                <option value="choose-workspace">Choose workspace</option>
+              </select>
+            </label>
+            <div className="mt-5 flex justify-end">
+              <button type="button" onClick={() => setOpeningSettingsOpen(false)} className="rounded-lg bg-blue-500 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-400">
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {clearRecentConfirmOpen ? (
+        <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/70 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-slate-600 bg-slate-900 p-5 shadow-2xl shadow-black/70">
+            <h2 className="text-lg font-semibold text-white">Clear recent files?</h2>
+            <p className="mt-2 text-sm leading-6 text-slate-400">
+              This will only remove the recent files list. Your PDFs and workspace documents will not be deleted.
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button type="button" onClick={() => setClearRecentConfirmOpen(false)} className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-300 hover:bg-slate-800">
+                Cancel
+              </button>
+              <button type="button" onClick={() => void clearRecentFiles()} className="rounded-lg bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-400">
+                Clear
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <header
         ref={headerRef}
         className="sticky top-0 z-50 border-b border-slate-600/90 bg-[#111827] px-3 py-2.5 shadow-lg shadow-slate-950/40 backdrop-blur-2xl sm:px-4"
@@ -5227,15 +5574,37 @@ function App() {
                 <div className="my-1 border-t border-slate-700" />
                 <p className="px-3 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Recent Files</p>
                 {recentFiles.length > 0 ? recentFiles.slice(0, 8).map((recentFile) => (
-                  <ToolbarMenuItem key={recentFile.id} onClick={() => {
-                    closeToolbarMenu()
-                    void openRecentPdf(recentFile.id)
-                  }} icon={<HistoryRegular className="size-4" />} title={recentFile.name}>
-                    <span className="block max-w-52 truncate">{recentFile.name}</span>
-                  </ToolbarMenuItem>
+                  <div key={recentFile.id} className="rounded-lg px-1 py-1 hover:bg-slate-800/60">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        closeToolbarMenu()
+                        void openRecentPdf(recentFile.id)
+                      }}
+                      title={recentFile.name}
+                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm font-medium text-slate-200 hover:bg-slate-800"
+                    >
+                      <HistoryRegular className="size-4 shrink-0 text-slate-400" />
+                      <span className="block max-w-44 truncate">{recentFile.name}</span>
+                    </button>
+                    <div className="ml-6 flex flex-wrap gap-1 pb-1">
+                      <button type="button" onClick={() => void openRecentPdf(recentFile.id)} className="rounded px-2 py-1 text-[11px] text-slate-400 hover:bg-slate-700 hover:text-white">Open</button>
+                      <button type="button" onClick={() => void removeRecentFile(recentFile.id)} className="rounded px-2 py-1 text-[11px] text-slate-400 hover:bg-slate-700 hover:text-white">Remove</button>
+                      <button type="button" onClick={() => void window.electronAPI.revealPdf(recentFile.id)} className="rounded px-2 py-1 text-[11px] text-slate-400 hover:bg-slate-700 hover:text-white">Reveal</button>
+                    </div>
+                  </div>
                 )) : (
                   <p className="px-3 py-2 text-sm text-slate-500">No recent PDFs</p>
                 )}
+                {recentFiles.length > 0 ? (
+                  <>
+                    <div className="my-1 border-t border-slate-700" />
+                    <ToolbarMenuItem onClick={() => {
+                      closeToolbarMenu()
+                      setClearRecentConfirmOpen(true)
+                    }} icon={<DismissRegular className="size-4" />}>Clear Recent Files</ToolbarMenuItem>
+                  </>
+                ) : null}
               </ToolbarMenuPanel>
             ) : null}
           </div>
@@ -5562,6 +5931,10 @@ function App() {
                   setShortcutHelpOpen((isOpen) => !isOpen)
                   closeToolbarMenu()
                 }} icon={<MoreHorizontalRegular className="size-4" />}>Keyboard Shortcuts</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => {
+                  setOpeningSettingsOpen(true)
+                  closeToolbarMenu()
+                }} icon={<OpenFolderRegular className="size-4" />}>Opening Settings</ToolbarMenuItem>
               </ToolbarMenuPanel>
             ) : null}
           </div>

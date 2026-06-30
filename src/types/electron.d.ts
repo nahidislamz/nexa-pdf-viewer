@@ -197,6 +197,8 @@ type PdfWorkspace = {
   }
 }
 
+type PdfOpenDestinationPreference = 'ask' | 'individual' | 'current-workspace' | 'choose-workspace'
+
 type PdfPaneAssignment = {
   id: 'left' | 'right'
   tabId: string | null
@@ -244,6 +246,8 @@ declare global {
       setDefaultSignature: (id: string) => Promise<SavedSignature[]>
       getRecentPdfs: () => Promise<Array<{ id: string; name: string }>>
       openRecentPdf: (id: string) => Promise<OpenedPdf>
+      clearRecentPdfs: () => Promise<Array<{ id: string; name: string }>>
+      removeRecentPdf: (id: string) => Promise<Array<{ id: string; name: string }>>
       getWorkspace: () => Promise<PdfWorkspace>
       saveWorkspace: (workspace: PdfWorkspace) => Promise<PdfWorkspace>
       listWorkspaces: () => Promise<WorkspaceList>
@@ -253,6 +257,7 @@ declare global {
       updateWorkspace: (id: string, patch: Partial<WorkspaceCreateInput>) => Promise<WorkspaceSummary>
       deleteWorkspace: (id: string) => Promise<{ activeWorkspaceId: string; deletedActive: boolean; session: PdfWorkspace }>
       switchWorkspace: (id: string, currentSession: PdfWorkspace) => Promise<{ workspace: WorkspaceSummary; session: PdfWorkspace }>
+      addWorkspaceDocument: (workspaceId: string, documentId: string) => Promise<WorkspaceDetails>
       removeWorkspaceDocument: (workspaceId: string, documentId: string) => Promise<WorkspaceDetails>
       exportWorkspace: (id: string, format: 'json' | 'zip') => Promise<string | null>
       importWorkspace: () => Promise<{
@@ -355,6 +360,10 @@ declare global {
         width: number
         collapsed: boolean
       }) => Promise<void>
+      getPdfOpenDestination: () => Promise<PdfOpenDestinationPreference>
+      setPdfOpenDestination: (
+        destination: PdfOpenDestinationPreference,
+      ) => Promise<PdfOpenDestinationPreference>
       getFullscreen: () => Promise<boolean>
       toggleFullscreen: () => Promise<boolean>
       exitFullscreen: () => Promise<boolean>

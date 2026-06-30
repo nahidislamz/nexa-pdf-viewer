@@ -42,6 +42,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setDefaultSignature: (id) => ipcRenderer.invoke('signatures:set-default', id),
   getRecentPdfs: () => ipcRenderer.invoke('pdf:recent-list'),
   openRecentPdf: (id) => ipcRenderer.invoke('pdf:open-recent', id),
+  clearRecentPdfs: () => ipcRenderer.invoke('pdf:recent-clear'),
+  removeRecentPdf: (id) => ipcRenderer.invoke('pdf:recent-remove', id),
   getWorkspace: () => ipcRenderer.invoke('workspace:get'),
   saveWorkspace: (workspace) => ipcRenderer.invoke('workspace:save', workspace),
   listWorkspaces: () => ipcRenderer.invoke('workspaces:list'),
@@ -52,6 +54,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   deleteWorkspace: (id) => ipcRenderer.invoke('workspaces:delete', id),
   switchWorkspace: (id, currentSession) =>
     ipcRenderer.invoke('workspaces:switch', id, currentSession),
+  addWorkspaceDocument: (workspaceId, documentId) =>
+    ipcRenderer.invoke('workspaces:add-document', workspaceId, documentId),
   removeWorkspaceDocument: (workspaceId, documentId) =>
     ipcRenderer.invoke('workspaces:remove-document', workspaceId, documentId),
   exportWorkspace: (id, format) => ipcRenderer.invoke('workspaces:export', id, format),
@@ -117,6 +121,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getSidebarLayout: () => ipcRenderer.invoke('preferences:get-sidebar-layout'),
   setSidebarLayout: (sidebarLayout) =>
     ipcRenderer.invoke('preferences:set-sidebar-layout', sidebarLayout),
+  getPdfOpenDestination: () => ipcRenderer.invoke('preferences:get-pdf-open-destination'),
+  setPdfOpenDestination: (destination) =>
+    ipcRenderer.invoke('preferences:set-pdf-open-destination', destination),
   getFullscreen: () => ipcRenderer.invoke('window:get-fullscreen'),
   toggleFullscreen: () => ipcRenderer.invoke('window:toggle-fullscreen'),
   exitFullscreen: () => ipcRenderer.invoke('window:exit-fullscreen'),

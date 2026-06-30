@@ -84,6 +84,7 @@ function emptyStore() {
       viewerBackground: 'dark-gray',
       sidebarWidth: 280,
       sidebarCollapsed: false,
+      defaultPdfOpenDestination: 'ask',
     },
     windowState: null,
   }
@@ -247,6 +248,9 @@ async function readStore() {
           : 'dark-gray',
         sidebarWidth: Math.min(400, Math.max(220, Number(parsed.preferences?.sidebarWidth) || 280)),
         sidebarCollapsed: parsed.preferences?.sidebarCollapsed === true,
+        defaultPdfOpenDestination: sanitizePdfOpenDestination(
+          parsed.preferences?.defaultPdfOpenDestination,
+        ),
       },
       windowState: sanitizeWindowState(parsed.windowState),
     }
@@ -640,6 +644,12 @@ function sanitizeWorkspaceIcon(icon) {
   return ['library', 'research', 'graduation', 'legal', 'finance', 'folder'].includes(icon)
     ? icon
     : 'folder'
+}
+
+function sanitizePdfOpenDestination(destination) {
+  return ['ask', 'individual', 'current-workspace', 'choose-workspace'].includes(destination)
+    ? destination
+    : 'ask'
 }
 
 function validIsoDate(value) {
@@ -1780,7 +1790,6 @@ async function loadPdf(filePath) {
       missing: false,
     }
     store.documentRegistry[id] = documentRecord
-    addDocumentToActiveWorkspace(store, id, name)
     ensureReferenceForDocument(store, documentRecord)
     store.recentFiles = [
       documentRecord,
@@ -2669,6 +2678,22 @@ ipcMain.handle('pdf:recent-list', () =>
   }),
 )
 
+ipcMain.handle('pdf:recent-clear', () =>
+  withStore(async (store) => {
+    store.recentFiles = []
+    await saveStore(store)
+    return []
+  }),
+)
+
+ipcMain.handle('pdf:recent-remove', (_event, id) =>
+  withStore(async (store) => {
+    store.recentFiles = store.recentFiles.filter((item) => item.id !== id)
+    await saveStore(store)
+    return store.recentFiles.map(({ id: documentId, name }) => ({ id: documentId, name }))
+  }),
+)
+
 ipcMain.handle('pdf:open-recent', (_event, id) =>
   withStore(async (store) => {
     const recentFile = store.documentRegistry[id] ?? store.recentFiles.find((item) => item.id === id)
@@ -2686,7 +2711,6 @@ ipcMain.handle('pdf:open-recent', (_event, id) =>
       recentFile.openedAt = Date.now()
       recentFile.missing = false
       store.documentRegistry[id] = recentFile
-      addDocumentToActiveWorkspace(store, id, recentFile.name)
       ensureReferenceForDocument(store, recentFile)
       store.recentFiles = [
         recentFile,
@@ -2851,6 +2875,22 @@ ipcMain.handle('workspaces:remove-document', (_event, workspaceId, documentId) =
     workspace.session = removeDocumentFromWorkspace(workspace.session, documentId)
     addWorkspaceActivity(workspace, 'document-removed', 'Removed document from workspace', { documentId })
     if (workspace.id === store.workspaceSystem.activeWorkspaceId) store.workspace = workspace.session
+    await saveStore(store)
+    return workspaceDetails(store, workspace)
+  }),
+)
+
+ipcMain.handle('workspaces:add-document', (_event, workspaceId, documentId) =>
+  withStore(async (store) => {
+    const workspace = store.workspaceSystem.items.find((candidate) => candidate.id === workspaceId)
+    if (!workspace) throw new Error('Workspace no longer exists.')
+    const document = store.documentRegistry[documentId] ?? store.recentFiles.find((item) => item.id === documentId)
+    if (!document) throw new Error('The PDF is no longer available.')
+    if (!workspace.documentIds.includes(documentId)) {
+      workspace.documentIds.push(documentId)
+      addWorkspaceActivity(workspace, 'document-added', `Added ${document.name}`, { documentId })
+    }
+    workspace.updatedAt = new Date().toISOString()
     await saveStore(store)
     return workspaceDetails(store, workspace)
   }),
@@ -4004,6 +4044,18 @@ ipcMain.handle('preferences:set-sidebar-layout', (_event, sidebarLayout) =>
     )
     store.preferences.sidebarCollapsed = sidebarLayout?.collapsed === true
     await saveStore(store)
+  }),
+)
+
+ipcMain.handle('preferences:get-pdf-open-destination', () =>
+  withStore((store) => sanitizePdfOpenDestination(store.preferences.defaultPdfOpenDestination)),
+)
+
+ipcMain.handle('preferences:set-pdf-open-destination', (_event, destination) =>
+  withStore(async (store) => {
+    store.preferences.defaultPdfOpenDestination = sanitizePdfOpenDestination(destination)
+    await saveStore(store)
+    return store.preferences.defaultPdfOpenDestination
   }),
 )
 
