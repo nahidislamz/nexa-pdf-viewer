@@ -15,7 +15,8 @@ type DatePreset = 'all' | 'today' | '7days' | '30days' | 'custom'
 
 const RESULT_HEIGHT = 142
 const TYPE_LABELS: Record<GlobalSearchResultType, string> = {
-  'pdf-text': 'PDF Text',
+  'pdf-text': 'Embedded Text',
+  'ocr-text': 'OCR Text',
   highlight: 'Highlight',
   note: 'Note',
   bookmark: 'Bookmark',
@@ -25,6 +26,7 @@ const TYPE_LABELS: Record<GlobalSearchResultType, string> = {
 }
 const TYPE_STYLES: Record<GlobalSearchResultType, string> = {
   'pdf-text': 'bg-slate-500/15 text-slate-300',
+  'ocr-text': 'bg-fuchsia-400/15 text-fuchsia-200',
   highlight: 'bg-amber-400/15 text-amber-200',
   note: 'bg-emerald-400/15 text-emerald-200',
   bookmark: 'bg-sky-400/15 text-sky-200',
@@ -77,7 +79,7 @@ export function GlobalSearchPanel({
       try {
         const info = await window.electronAPI.getSearchLibraryInfo()
         if (cancelled) return
-        const signature = info.documents.map((document) => `${document.documentId}:${document.status}:${document.indexedPages}`).join('|')
+        const signature = info.documents.map((document) => `${document.documentId}:${document.status}:${document.indexedPages}:${document.indexedAt ?? ''}`).join('|')
         setLibraryInfo(info)
         if (indexSignatureRef.current && signature !== indexSignatureRef.current) {
           setIndexRevision((revision) => revision + 1)
@@ -302,7 +304,7 @@ function SearchResultCard({ result, query, top, onOpen }: { result: GlobalSearch
   return (
     <article className="absolute left-3 right-3 rounded-xl border border-slate-700 bg-slate-900 p-3 shadow-sm transition hover:border-blue-400/60 hover:bg-slate-800" style={{ top: top + 6, height: RESULT_HEIGHT - 12 }}>
       <button type="button" onClick={onOpen} className="block h-full w-full text-left">
-        <div className="flex items-center gap-2"><span className={`rounded-md px-2 py-1 text-[10px] font-bold uppercase tracking-wider ${TYPE_STYLES[result.type]}`}>{TYPE_LABELS[result.type]}</span>{result.category ? <span className="text-[10px] capitalize text-slate-500">{result.category}</span> : null}<span className="ml-auto text-[10px] text-slate-500">Page {result.pageNumber}</span></div>
+        <div className="flex items-center gap-2"><span className={`rounded-md px-2 py-1 text-[10px] font-bold uppercase tracking-wider ${TYPE_STYLES[result.type]}`}>{TYPE_LABELS[result.type]}</span>{result.lowConfidence ? <span className="rounded bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200">Low confidence</span> : null}{result.category ? <span className="text-[10px] capitalize text-slate-500">{result.category}</span> : null}<span className="ml-auto text-[10px] text-slate-500">Page {result.pageNumber}</span></div>
         <p className="mt-2 line-clamp-3 text-sm leading-5 text-slate-200"><HighlightedPreview text={result.preview} query={result.matchText ? `${query} ${result.matchText}` : query} /></p>
         <div className="mt-2 flex items-center gap-2 text-[11px] text-slate-500"><span className="min-w-0 flex-1 truncate" title={result.filePath}>{result.documentName}</span><span>Open source</span></div>
       </button>

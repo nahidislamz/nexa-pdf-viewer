@@ -52,6 +52,9 @@ export type WorkspaceDetails = WorkspaceSummary & {
     notes: number
     bookmarks: number
     savedSearches: number
+    ocrCompletedPages: number
+    ocrPendingPages: number
+    ocrFailedPages: number
     categories: Record<HighlightCategory, number>
   }
 }

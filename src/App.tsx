@@ -232,9 +232,13 @@ type PageOcrResult = {
   pageNumber: number
   text: string
   confidence: number
+  words: Array<{ text: string; confidence: number; x0: number; y0: number; x1: number; y1: number }>
+  lines: Array<{ text: string; confidence: number; x0: number; y0: number; x1: number; y1: number }>
   language: OcrLanguage
   createdAt: string
+  updatedAt: string
   status: 'complete' | 'failed'
+  lowConfidence: boolean
   error?: string
 }
 
@@ -707,6 +711,10 @@ function App() {
     () => new Set(pageOcrResults.filter((result) => result.status === 'complete' && result.text.trim()).map((result) => result.pageNumber)).size,
     [pageOcrResults],
   )
+  const lowConfidenceOcrPageCount = useMemo(
+    () => new Set(pageOcrResults.filter((result) => result.status === 'complete' && result.lowConfidence).map((result) => result.pageNumber)).size,
+    [pageOcrResults],
+  )
 
   const renderSearchText = useCallback(
     ({ pageNumber, itemIndex, str }: { pageNumber: number; itemIndex: number; str: string }) => {
@@ -870,7 +878,7 @@ function App() {
       }
 
       goToPageEvent(result.pageNumber, 'auto')
-      if (result.type !== 'pdf-text' || !query) {
+      if (!['pdf-text', 'ocr-text'].includes(result.type) || !query) {
         setPendingGlobalSearchNavigation(null)
         return
       }
@@ -5115,6 +5123,21 @@ function App() {
       if (activeDocumentIdRef.current === documentId) {
         setPageOcrResults(results)
       }
+      const completedResults = results.filter((result) => result.status === 'complete' && result.text.trim())
+      if (completedResults.length > 0) {
+        await window.electronAPI.appendOcrSearchIndexPages(
+          documentId,
+          completedResults.map((result) => ({
+            pageNumber: result.pageNumber,
+            text: result.text,
+            language: result.language,
+            confidence: result.confidence,
+            lowConfidence: result.lowConfidence,
+            createdAt: result.createdAt,
+            updatedAt: result.updatedAt,
+          })),
+        ).catch((error) => console.warn('Cached OCR search index update failed:', getErrorMessage(error)))
+      }
     } catch (error) {
       console.warn('Could not load OCR page results:', getErrorMessage(error))
     }
@@ -5192,7 +5215,7 @@ function App() {
       focusPane('right')
       if (result.highlightId) {
         rightPaneRef.current?.navigateToHighlight(result.highlightId, result.pageNumber)
-      } else if (result.type === 'pdf-text') {
+      } else if (result.type === 'pdf-text' || result.type === 'ocr-text') {
         rightPaneRef.current?.navigateToSearchResult(result.pageNumber, navigation.query)
       } else {
         rightPaneRef.current?.goToPage(result.pageNumber)
@@ -5492,7 +5515,15 @@ function App() {
         ])
         if (result.text.trim()) {
           await window.electronAPI.appendOcrSearchIndexPages(pdfFile.id, [
-            { pageNumber: result.pageNumber, text: result.text },
+            {
+              pageNumber: result.pageNumber,
+              text: result.text,
+              language: result.language,
+              confidence: result.confidence,
+              lowConfidence: result.lowConfidence,
+              createdAt: result.createdAt,
+              updatedAt: result.updatedAt,
+            },
           ]).catch((error) => console.warn('OCR search index update failed:', getErrorMessage(error)))
         }
       } catch (error) {
@@ -7800,6 +7831,7 @@ function App() {
                   loading={metadataLoading}
                   ocrDetection={ocrDetection}
                   ocrTextPages={ocrTextPageCount}
+                  lowConfidenceOcrPages={lowConfidenceOcrPageCount}
                 />
               ) : null}
 
@@ -8289,7 +8321,7 @@ function App() {
             {(!splitEnabled || activePane === 'left') && pdfFile ? (
               <>
                 <StatusDivider />
-                <StatusItem>{ocrTextPagesStatus(ocrDetection, ocrTextPageCount)}</StatusItem>
+                <StatusItem>{ocrTextPagesStatus(ocrDetection, ocrTextPageCount, lowConfidenceOcrPageCount)}</StatusItem>
               </>
             ) : null}
             {(splitEnabled && activePane === 'right' ? rightPaneState?.searchOpen : searchOpen) ? (
@@ -9055,6 +9087,7 @@ function DocumentInfoPanel({
   loading,
   ocrDetection,
   ocrTextPages,
+  lowConfidenceOcrPages,
 }: {
   file: PdfFile
   totalPages: number
@@ -9062,6 +9095,7 @@ function DocumentInfoPanel({
   loading: boolean
   ocrDetection: OcrDetectionResult
   ocrTextPages: number
+  lowConfidenceOcrPages: number
 }) {
   const rows = [
     ['File name', file.name],
@@ -9070,6 +9104,7 @@ function DocumentInfoPanel({
     ['Total pages', String(totalPages)],
     ['OCR status', ocrTextPages > 0 ? 'Scanned PDF - OCR Text Available' : ocrDetectionLabel(ocrDetection)],
     ['OCR text pages', ocrTextPages > 0 ? String(ocrTextPages) : 'None'],
+    ['Low-confidence OCR pages', lowConfidenceOcrPages > 0 ? String(lowConfidenceOcrPages) : 'None'],
     ['Title', metadata?.title],
     ['Author', metadata?.author],
     ['Subject', metadata?.subject],
@@ -9641,8 +9676,12 @@ function ocrDetectionLabel(detection: Partial<OcrDetectionResult> | null | undef
 function ocrTextPagesStatus(
   detection: Partial<OcrDetectionResult> | null | undefined,
   ocrTextPages: number,
+  lowConfidencePages = 0,
 ) {
-  return ocrTextPages > 0 ? `OCR Text: ${ocrTextPages} page${ocrTextPages === 1 ? '' : 's'}` : ocrDetectionLabel(detection)
+  if (ocrTextPages > 0) {
+    return `OCR Text: ${ocrTextPages} page${ocrTextPages === 1 ? '' : 's'}${lowConfidencePages > 0 ? ` (${lowConfidencePages} low confidence)` : ''}`
+  }
+  return ocrDetectionLabel(detection)
 }
 
 function sanitizeOcrLanguage(language: unknown): OcrLanguage {
@@ -9650,7 +9689,8 @@ function sanitizeOcrLanguage(language: unknown): OcrLanguage {
 }
 
 function searchMatchSourceLabel(match: SearchMatch | undefined) {
-  return match?.source === 'ocr' ? ' - OCR Text' : ''
+  if (!match) return ''
+  return match.source === 'ocr' ? ' - OCR Text' : ' - Embedded Text'
 }
 
 function countMeaningfulTextCharacters(text: string) {

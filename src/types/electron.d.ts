@@ -38,9 +38,13 @@ type PageOcrResult = {
   pageNumber: number
   text: string
   confidence: number
+  words: Array<{ text: string; confidence: number; x0: number; y0: number; x1: number; y1: number }>
+  lines: Array<{ text: string; confidence: number; x0: number; y0: number; x1: number; y1: number }>
   language: OcrLanguage
   createdAt: string
+  updatedAt: string
   status: 'complete' | 'failed'
+  lowConfidence: boolean
   error?: string
 }
 
@@ -141,7 +145,7 @@ type HighlightLibrary = {
   }
 }
 
-type GlobalSearchResultType = 'pdf-text' | 'highlight' | 'note' | 'bookmark' | 'file' | 'metadata' | 'reference'
+type GlobalSearchResultType = 'pdf-text' | 'ocr-text' | 'highlight' | 'note' | 'bookmark' | 'file' | 'metadata' | 'reference'
 type GlobalSearchFilters = {
   type: GlobalSearchResultType | 'all'
   category: PdfHighlight['category'] | 'all'
@@ -164,6 +168,9 @@ type GlobalSearchResult = {
   highlightId?: string
   category?: PdfHighlight['category']
   color?: PdfHighlight['color']
+  language?: string
+  confidence?: number
+  lowConfidence?: boolean
   createdDate?: string | null
   modifiedDate?: string | null
   score: number
@@ -372,7 +379,15 @@ declare global {
       getSearchIndexStatus: (identity: { id: string; fileSize: number; modifiedAt: number }) => Promise<{ current: boolean; status: 'pending' | 'complete'; indexedPages: number; totalPages: number }>
       startSearchIndex: (payload: { id: string; name: string; filePath: string; fileSize: number; modifiedAt: number; totalPages: number; metadata: Record<string, string>; bookmarks: Array<{ title: string; pageNumber: number }> }) => Promise<{ accepted: boolean }>
       appendSearchIndexPages: (documentId: string, pages: Array<{ pageNumber: number; text: string }>) => Promise<{ accepted: boolean; indexedPages?: number }>
-      appendOcrSearchIndexPages: (documentId: string, pages: Array<{ pageNumber: number; text: string }>) => Promise<{ accepted: boolean; indexedPages?: number }>
+      appendOcrSearchIndexPages: (documentId: string, pages: Array<{
+        pageNumber: number
+        text: string
+        language?: OcrLanguage
+        confidence?: number
+        lowConfidence?: boolean
+        createdAt?: string
+        updatedAt?: string
+      }>) => Promise<{ accepted: boolean; indexedPages?: number }>
       completeSearchIndex: (documentId: string) => Promise<{ indexedPages: number; totalPages: number }>
       cancelSearchIndex: (documentId: string) => Promise<void>
       searchLibrary: (request: { query: string; filters: GlobalSearchFilters }) => Promise<GlobalSearchResponse>

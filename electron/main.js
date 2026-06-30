@@ -695,15 +695,39 @@ function sanitizePageOcrResult(result) {
   const language = sanitizeOcrLanguage(result.language)
   const status = result.status === 'failed' ? 'failed' : 'complete'
   const createdAt = validIsoDate(result.createdAt) ?? new Date().toISOString()
+  const updatedAt = validIsoDate(result.updatedAt) ?? createdAt
+  const confidence = Math.min(100, Math.max(0, Number(result.confidence) || 0))
   return {
     pageNumber,
     text: String(result.text ?? '').slice(0, 2_000_000),
-    confidence: Math.min(100, Math.max(0, Number(result.confidence) || 0)),
+    confidence,
+    words: sanitizeOcrTextItems(result.words),
+    lines: sanitizeOcrTextItems(result.lines),
     language,
     createdAt,
+    updatedAt,
     status,
+    lowConfidence: result.lowConfidence === true || confidence < 55,
     error: typeof result.error === 'string' ? result.error.slice(0, 1000) : '',
   }
+}
+
+function sanitizeOcrTextItems(items) {
+  return Array.isArray(items)
+    ? items.slice(0, 20000).flatMap((item) => {
+        const text = String(item?.text ?? '').trim()
+        if (!text) return []
+        const bbox = item?.bbox ?? item
+        return [{
+          text: text.slice(0, 1000),
+          confidence: Math.min(100, Math.max(0, Number(item?.confidence) || 0)),
+          x0: Math.max(0, Number(bbox?.x0) || 0),
+          y0: Math.max(0, Number(bbox?.y0) || 0),
+          x1: Math.max(0, Number(bbox?.x1) || 0),
+          y1: Math.max(0, Number(bbox?.y1) || 0),
+        }]
+      })
+    : []
 }
 
 function getStoredOcrResults(store, documentId) {
@@ -1142,6 +1166,27 @@ function workspaceSummary(workspace, store) {
   }
 }
 
+function workspaceOcrStats(store, documentIds, totalPagesByDocument = {}) {
+  let completedPages = 0
+  let failedPages = 0
+  let pendingPages = 0
+
+  for (const documentId of documentIds) {
+    const documentOcr = store.ocrDocuments?.[documentId]
+    const results = Object.values(documentOcr?.pages ?? {}).map(sanitizePageOcrResult).filter(Boolean)
+    const completedPageNumbers = new Set(results.filter((result) => result.status === 'complete' && result.text.trim()).map((result) => result.pageNumber))
+    const failedPageNumbers = new Set(results.filter((result) => result.status === 'failed').map((result) => result.pageNumber))
+    const knownTotalPages = Math.max(0, Math.trunc(Number(totalPagesByDocument[documentId]) || 0))
+    completedPages += completedPageNumbers.size
+    failedPages += failedPageNumbers.size
+    if (knownTotalPages > 0) {
+      pendingPages += Math.max(0, knownTotalPages - completedPageNumbers.size - failedPageNumbers.size)
+    }
+  }
+
+  return { completedPages, pendingPages, failedPages }
+}
+
 async function workspaceDetails(store, workspace) {
   if (store.highlightLibraryVersion !== 2) rebuildHighlightLibraryIndex(store)
   const documentIds = new Set(workspace.documentIds)
@@ -1155,6 +1200,7 @@ async function workspaceDetails(store, workspace) {
     if (entry.note) notes += 1
   }
   const indexedStats = await globalSearchIndex.getWorkspaceStats(workspace.documentIds, workspace.id)
+  const ocrStats = workspaceOcrStats(store, workspace.documentIds, indexedStats.totalPagesByDocument)
   const savedSearches = await globalSearchIndex.getWorkspaceSavedSearches(workspace.id)
   return {
     ...workspaceSummary(workspace, store),
@@ -1189,6 +1235,9 @@ async function workspaceDetails(store, workspace) {
       notes,
       bookmarks: indexedStats.bookmarks,
       savedSearches: indexedStats.savedSearches,
+      ocrCompletedPages: ocrStats.completedPages,
+      ocrPendingPages: ocrStats.pendingPages,
+      ocrFailedPages: ocrStats.failedPages,
       categories,
     },
   }
@@ -3622,12 +3671,18 @@ ipcMain.handle('ocr:run-page', async (event, request) => {
       throw new Error('OCR cancelled.')
     }
     const createdAt = new Date().toISOString()
+    const previousResult = await withStore((store) =>
+      sanitizePageOcrResult(store.ocrDocuments?.[documentId]?.pages?.[resultKey]),
+    )
     const result = sanitizePageOcrResult({
       pageNumber,
       text: recognized.data.text,
       confidence: recognized.data.confidence,
+      words: recognized.data.words,
+      lines: recognized.data.lines,
       language,
-      createdAt,
+      createdAt: previousResult?.createdAt ?? createdAt,
+      updatedAt: createdAt,
       status: 'complete',
     })
     await withStore(async (store) => {
@@ -3656,9 +3711,13 @@ ipcMain.handle('ocr:run-page', async (event, request) => {
       pageNumber,
       text: '',
       confidence: 0,
+      words: [],
+      lines: [],
       language,
       createdAt,
+      updatedAt: createdAt,
       status: 'failed',
+      lowConfidence: true,
       error: error instanceof Error ? error.message : String(error),
     })
     await withStore(async (store) => {

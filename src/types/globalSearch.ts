@@ -2,6 +2,7 @@ import type { HighlightCategory, HighlightColor } from './highlights'
 
 export type GlobalSearchResultType =
   | 'pdf-text'
+  | 'ocr-text'
   | 'highlight'
   | 'note'
   | 'bookmark'
@@ -32,6 +33,9 @@ export type GlobalSearchResult = {
   highlightId?: string
   category?: HighlightCategory
   color?: HighlightColor
+  language?: string
+  confidence?: number
+  lowConfidence?: boolean
   createdDate?: string | null
   modifiedDate?: string | null
   score: number

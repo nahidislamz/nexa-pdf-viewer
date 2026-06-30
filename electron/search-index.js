@@ -8,6 +8,7 @@ const TYPE_WEIGHTS = {
   note: 100,
   highlight: 90,
   bookmark: 80,
+  'ocr-text': 62,
   'pdf-text': 60,
   metadata: 50,
   reference: 55,
@@ -132,6 +133,7 @@ export class GlobalSearchIndex {
           status: identityChanged ? 'pending' : existing?.status ?? 'pending',
           totalPages: identityChanged ? 0 : existing?.totalPages ?? 0,
           pages: identityChanged ? [] : existing?.pages ?? [],
+          ocrPages: identityChanged ? [] : existing?.ocrPages ?? [],
           bookmarks: identityChanged ? [] : existing?.bookmarks ?? [],
           metadata: identityChanged ? {} : existing?.metadata ?? {},
           highlights: sourceHighlights?.highlights ?? existing?.highlights ?? [],
@@ -179,6 +181,7 @@ export class GlobalSearchIndex {
         indexedAt: identityChanged ? null : existing?.indexedAt ?? null,
         status: identityChanged ? 'pending' : existing?.status ?? 'pending',
         pages: identityChanged ? [] : existing?.pages ?? [],
+        ocrPages: identityChanged ? [] : existing?.ocrPages ?? [],
         bookmarks: identityChanged ? [] : existing?.bookmarks ?? [],
         metadata: identityChanged ? {} : existing?.metadata ?? {},
         highlights: identityChanged ? [] : existing?.highlights ?? [],
@@ -203,6 +206,7 @@ export class GlobalSearchIndex {
         modifiedAt: Number(record.modifiedAt) || 0,
         status: existing?.status ?? 'pending',
         pages: existing?.pages ?? [],
+        ocrPages: existing?.ocrPages ?? [],
         bookmarks: existing?.bookmarks ?? [],
         metadata: existing?.metadata ?? {},
         highlights,
@@ -226,6 +230,7 @@ export class GlobalSearchIndex {
         modifiedAt: Number(record.modifiedAt) || 0,
         status: existing?.status ?? 'pending',
         pages: existing?.pages ?? [],
+        ocrPages: existing?.ocrPages ?? [],
         bookmarks: existing?.bookmarks ?? [],
         highlights: existing?.highlights ?? [],
         metadata: {
@@ -294,6 +299,7 @@ export class GlobalSearchIndex {
         metadata: sanitizeMetadata(payload.metadata),
         bookmarks: sanitizeBookmarks(payload.bookmarks),
         pages: [],
+        ocrPages: this.documents.get(documentId)?.ocrPages ?? [],
       })
       return { accepted: true }
     })
@@ -318,22 +324,29 @@ export class GlobalSearchIndex {
       const existing = this.documents.get(id)
       if (!existing) return { accepted: false, indexedPages: 0 }
 
-      const pagesByNumber = new Map(existing.pages.map((page) => [page.pageNumber, page]))
+      const ocrPagesByKey = new Map((existing.ocrPages ?? []).map((page) => [`${page.pageNumber}:${page.language}`, page]))
       for (const page of Array.isArray(pages) ? pages.slice(0, 200) : []) {
         const pageNumber = Math.max(1, Math.trunc(Number(page?.pageNumber) || 0))
         const text = typeof page?.text === 'string' ? page.text.slice(0, 1_000_000).trim() : ''
+        const language = String(page?.language ?? 'eng').slice(0, 12)
+        const confidence = Math.min(100, Math.max(0, Number(page?.confidence) || 0))
+        const lowConfidence = page?.lowConfidence === true || confidence < 55
         if (!pageNumber || !text) continue
-        const current = pagesByNumber.get(pageNumber)
-        pagesByNumber.set(pageNumber, {
+        ocrPagesByKey.set(`${pageNumber}:${language}`, {
           pageNumber,
-          text: current?.text ? `${current.text}\n\n${text}` : text,
+          language,
+          text,
+          confidence,
+          lowConfidence,
+          createdAt: page?.createdAt ? String(page.createdAt) : new Date().toISOString(),
+          updatedAt: page?.updatedAt ? String(page.updatedAt) : new Date().toISOString(),
         })
       }
 
       const document = sanitizeSearchDocument({
         ...existing,
         status: existing.status === 'complete' ? 'complete' : 'pending',
-        pages: [...pagesByNumber.values()].sort((left, right) => left.pageNumber - right.pageNumber),
+        ocrPages: [...ocrPagesByKey.values()].sort((left, right) => left.pageNumber - right.pageNumber || left.language.localeCompare(right.language)),
         indexedAt: new Date().toISOString(),
       })
       this.documents.set(id, document)
@@ -354,6 +367,7 @@ export class GlobalSearchIndex {
         status: 'complete',
         indexedAt: new Date().toISOString(),
         pages: session.pages.filter(Boolean),
+        ocrPages: existing?.ocrPages ?? [],
         highlights: existing?.highlights ?? [],
         metadata: { ...existing?.metadata, ...session.metadata },
       })
@@ -445,11 +459,18 @@ export class GlobalSearchIndex {
     return this.enqueue(async () => {
       const ids = new Set(Array.isArray(documentIds) ? documentIds : [])
       let bookmarks = 0
+      let totalPages = 0
+      const totalPagesByDocument = {}
       for (const documentId of ids) {
-        bookmarks += this.documents.get(documentId)?.bookmarks.length ?? 0
+        const document = this.documents.get(documentId)
+        bookmarks += document?.bookmarks.length ?? 0
+        totalPages += document?.totalPages ?? 0
+        totalPagesByDocument[documentId] = document?.totalPages ?? 0
       }
       return {
         bookmarks,
+        totalPages,
+        totalPagesByDocument,
         savedSearches: this.manifest.savedSearches.filter(
           (search) => search.workspaceId === workspaceId,
         ).length,
@@ -620,6 +641,21 @@ function sanitizeSearchDocument(document) {
       const pageNumber = Math.max(1, Math.trunc(Number(page?.pageNumber) || 0))
       return typeof page?.text === 'string' ? [{ pageNumber, text: page.text }] : []
     }) : [],
+    ocrPages: Array.isArray(document.ocrPages) ? document.ocrPages.flatMap((page) => {
+      const pageNumber = Math.max(1, Math.trunc(Number(page?.pageNumber) || 0))
+      const text = typeof page?.text === 'string' ? page.text.slice(0, 1_000_000) : ''
+      if (!pageNumber || !text.trim()) return []
+      const confidence = Math.min(100, Math.max(0, Number(page?.confidence) || 0))
+      return [{
+        pageNumber,
+        language: String(page?.language ?? 'eng').slice(0, 12),
+        text,
+        confidence,
+        lowConfidence: page?.lowConfidence === true || confidence < 55,
+        createdAt: page?.createdAt ? String(page.createdAt) : document.indexedAt,
+        updatedAt: page?.updatedAt ? String(page.updatedAt) : document.indexedAt,
+      }]
+    }) : [],
     bookmarks: sanitizeBookmarks(document.bookmarks),
     metadata: sanitizeMetadata(document.metadata),
     highlights: Array.isArray(document.highlights) ? document.highlights.flatMap((highlight) => {
@@ -695,6 +731,20 @@ function buildRecords(document) {
   const referenceText = [document.metadata.title, document.metadata.author, document.metadata.keywords, document.metadata.publisher, document.metadata.journal, document.metadata.conference, document.metadata.doi, document.metadata.isbn, document.metadata.collections].filter(Boolean).join('\n')
   if (referenceText) records.push({ ...base, id: `${document.documentId}:reference`, type: 'reference', pageNumber: 1, text: referenceText, createdDate: document.indexedAt, modifiedDate: document.indexedAt })
   for (const page of document.pages) records.push({ ...base, id: `${document.documentId}:page:${page.pageNumber}`, type: 'pdf-text', pageNumber: page.pageNumber, text: page.text, createdDate: document.indexedAt, modifiedDate: document.indexedAt })
+  for (const page of document.ocrPages ?? []) {
+    records.push({
+      ...base,
+      id: `${document.documentId}:ocr:${page.pageNumber}:${page.language}`,
+      type: 'ocr-text',
+      pageNumber: page.pageNumber,
+      text: page.text,
+      language: page.language,
+      confidence: page.confidence,
+      lowConfidence: page.lowConfidence,
+      createdDate: page.createdAt ?? document.indexedAt,
+      modifiedDate: page.updatedAt ?? document.indexedAt,
+    })
+  }
   document.bookmarks.forEach((bookmark, index) => records.push({ ...base, id: `${document.documentId}:bookmark:${index}`, type: 'bookmark', pageNumber: bookmark.pageNumber, text: bookmark.title, createdDate: document.indexedAt, modifiedDate: document.indexedAt }))
   for (const highlight of document.highlights) {
     records.push({ ...base, id: `${document.documentId}:highlight:${highlight.id}`, type: 'highlight', pageNumber: highlight.pageNumber, text: highlight.text, highlightId: highlight.id, category: highlight.category, color: highlight.color, createdDate: highlight.createdDate, modifiedDate: highlight.modifiedDate })
@@ -714,7 +764,7 @@ function parseQuery(value) {
 }
 
 function sanitizeFilters(filters) {
-  const type = ['all', 'pdf-text', 'highlight', 'note', 'bookmark', 'file', 'metadata', 'reference'].includes(filters?.type) ? filters.type : 'all'
+  const type = ['all', 'pdf-text', 'ocr-text', 'highlight', 'note', 'bookmark', 'file', 'metadata', 'reference'].includes(filters?.type) ? filters.type : 'all'
   const category = ['all', 'important', 'research', 'reference', 'question'].includes(filters?.category) ? filters.category : 'all'
   return {
     type,

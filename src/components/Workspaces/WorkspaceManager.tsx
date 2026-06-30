@@ -163,13 +163,16 @@ export function WorkspaceManager({
               </div>
             </header>
 
-            <div className="mt-5 grid grid-cols-2 gap-3 md:grid-cols-6">
+            <div className="mt-5 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-9">
               <Stat label="Documents" value={details.stats.documents} />
               <Stat label="References" value={details.stats.references} />
               <Stat label="Highlights" value={details.stats.highlights} />
               <Stat label="Notes" value={details.stats.notes} />
               <Stat label="Bookmarks" value={details.stats.bookmarks} />
               <Stat label="Saved Searches" value={details.stats.savedSearches} />
+              <Stat label="OCR Done" value={details.stats.ocrCompletedPages} />
+              <Stat label="OCR Pending" value={details.stats.ocrPendingPages} />
+              <Stat label="OCR Failed" value={details.stats.ocrFailedPages} />
             </div>
 
             <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1.6fr)_minmax(280px,0.8fr)]">
