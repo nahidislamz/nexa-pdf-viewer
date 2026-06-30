@@ -51,6 +51,24 @@ type PageOcrResult = {
   error?: string
 }
 
+type SearchablePdfExportProgress = {
+  operationId: string
+  status: string
+  pageNumber: number | null
+  completedPages: number
+  totalPages: number
+  progress: number
+  estimatedRemainingMs: number | null
+}
+
+type SearchablePdfExportResult = {
+  outputPath: string
+  openedPdf: OpenedPdf | null
+  pagesExported: number
+  textItems: number
+  verifiedText: boolean
+}
+
 type OpenedPdf = {
   id: string
   name: string
@@ -343,6 +361,16 @@ declare global {
         force?: boolean
       }) => Promise<PageOcrResult>
       cancelPageOcr: (operationId: string) => Promise<void>
+      exportSearchablePdf: (options: {
+        operationId: string
+        identity: { id: string; fileSize: number; modifiedAt: number }
+        scope: 'current' | 'selected' | 'entire'
+        pageNumbers?: number[]
+        language: OcrLanguage
+        coverageMode?: 'ask' | 'entire' | 'ocr-only'
+      }) => Promise<SearchablePdfExportResult | null>
+      cancelSearchablePdfExport: (operationId: string) => Promise<void>
+      onSearchablePdfExportProgress: (callback: (progress: SearchablePdfExportProgress) => void) => () => void
       onPageOcrProgress: (callback: (progress: {
         operationId: string
         status: string

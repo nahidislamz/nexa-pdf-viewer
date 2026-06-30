@@ -62,6 +62,7 @@ let processingSystemPdf = false
 const pendingSystemPdfPaths = []
 const DEFAULT_WORKSPACE_ID = 'default-workspace'
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
+const activeSearchablePdfExports = new Map()
 
 if (!hasSingleInstanceLock) {
   app.quit()
@@ -2263,6 +2264,313 @@ async function saveSignedPdf(options) {
   return { outputPath, openedPdf: null }
 }
 
+async function exportSearchablePdf(event, options) {
+  const operationId = String(options?.operationId ?? randomUUID()).slice(0, 120)
+  const identity = options?.identity ?? {}
+  const scope = ['current', 'selected', 'entire'].includes(options?.scope) ? options.scope : 'entire'
+  const preferredLanguage = sanitizeOcrLanguage(options?.language)
+  const requestedPages = Array.isArray(options?.pageNumbers)
+    ? [...new Set(options.pageNumbers.map((page) => Math.max(1, Math.trunc(Number(page) || 0))).filter(Boolean))].sort((a, b) => a - b)
+    : []
+
+  const sourceRecord = await withStore((store) => {
+    const record = store.documentRegistry[identity.id] ?? store.recentFiles.find((item) => item.id === identity.id)
+    if (!record) return null
+    if (
+      record.fileSize !== Number(identity.fileSize) ||
+      record.modifiedAt !== Number(identity.modifiedAt)
+    ) {
+      throw new Error('The PDF identity changed. Reopen the document before exporting a searchable copy.')
+    }
+    return { ...record }
+  })
+  if (!sourceRecord) throw new Error('The original PDF is no longer available.')
+
+  let sourceBytes
+  let sourceStats
+  try {
+    ;[sourceBytes, sourceStats] = await Promise.all([
+      fs.readFile(sourceRecord.path),
+      fs.stat(sourceRecord.path),
+    ])
+  } catch (error) {
+    if (error.code === 'ENOENT') throw new Error(`Original PDF not found: ${sourceRecord.name}`)
+    throw error
+  }
+  if (sourceStats.size !== sourceRecord.fileSize || sourceStats.mtimeMs !== sourceRecord.modifiedAt) {
+    throw new Error('The original PDF changed on disk. Reopen it before exporting a searchable copy.')
+  }
+
+  const ocrResults = await withStore((store) => getStoredOcrResults(store, sourceRecord.id))
+  const ocrByPage = groupPreferredOcrResultsByPage(ocrResults, preferredLanguage)
+  if (ocrByPage.size === 0) {
+    throw new Error('No OCR data available.')
+  }
+
+  const sourcePdf = await PDFDocument.load(sourceBytes, { ignoreEncryption: false })
+  const totalPages = sourcePdf.getPageCount()
+  const validRequestedPages = requestedPages.filter((page) => page >= 1 && page <= totalPages)
+  let outputPageNumbers = scope === 'entire'
+    ? Array.from({ length: totalPages }, (_value, index) => index + 1)
+    : validRequestedPages
+  if (outputPageNumbers.length === 0) {
+    throw new Error('No valid pages were selected for searchable PDF export.')
+  }
+
+  const pagesWithOcr = outputPageNumbers.filter((pageNumber) => ocrByPage.has(pageNumber))
+  if (pagesWithOcr.length === 0) {
+    throw new Error('No OCR data available for the selected pages.')
+  }
+
+  if (scope === 'entire' && pagesWithOcr.length < outputPageNumbers.length && options?.coverageMode !== 'entire' && options?.coverageMode !== 'ocr-only') {
+    const choice = await dialog.showMessageBox(mainWindow ?? undefined, {
+      type: 'question',
+      title: 'Partial OCR Data',
+      message: 'OCR exists for only some pages.',
+      detail: `${pagesWithOcr.length} of ${outputPageNumbers.length} pages have cached OCR text.`,
+      buttons: ['Export entire PDF', 'Export OCR pages only', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+    })
+    if (choice.response === 2) return null
+    if (choice.response === 1) outputPageNumbers = pagesWithOcr
+  } else if (options?.coverageMode === 'ocr-only') {
+    outputPageNumbers = pagesWithOcr
+  }
+
+  const baseName = path.basename(sourceRecord.name, path.extname(sourceRecord.name))
+  const defaultName = sanitizePdfOutputName(`${baseName}-searchable.pdf`)
+  const saveResult = await dialog.showSaveDialog(mainWindow ?? undefined, {
+    title: 'Save Searchable PDF',
+    defaultPath: defaultName,
+    filters: [{ name: 'PDF Document', extensions: ['pdf'] }],
+  })
+  if (saveResult.canceled || !saveResult.filePath) return null
+
+  const outputPath = saveResult.filePath.toLowerCase().endsWith('.pdf') ? saveResult.filePath : `${saveResult.filePath}.pdf`
+  if (path.resolve(outputPath).toLowerCase() === path.resolve(sourceRecord.path).toLowerCase()) {
+    throw new Error('Choose a different filename. Next PDF Viewer will not overwrite the original PDF.')
+  }
+
+  const exportJob = { cancelled: false }
+  activeSearchablePdfExports.set(operationId, exportJob)
+  const startedAt = Date.now()
+  const sendProgress = (status, completedPages, currentPage = null) => {
+    if (!event.sender.isDestroyed()) {
+      const total = outputPageNumbers.length
+      const progress = total > 0 ? Math.min(1, Math.max(0, completedPages / total)) : 0
+      const elapsed = Date.now() - startedAt
+      const estimatedRemainingMs = completedPages > 0 && completedPages < total
+        ? Math.round((elapsed / completedPages) * (total - completedPages))
+        : null
+      event.sender.send('pdf:searchable-export-progress', {
+        operationId,
+        status,
+        pageNumber: currentPage,
+        completedPages,
+        totalPages: total,
+        progress,
+        estimatedRemainingMs,
+      })
+    }
+  }
+
+  try {
+    sendProgress('Preparing searchable PDF', 0, null)
+    const exportAllPages = outputPageNumbers.length === totalPages && outputPageNumbers.every((page, index) => page === index + 1)
+    const outputPdf = exportAllPages ? sourcePdf : await PDFDocument.create()
+    const pageMap = new Map()
+    if (!exportAllPages) {
+      const copiedPages = await outputPdf.copyPages(sourcePdf, outputPageNumbers.map((page) => page - 1))
+      copiedPages.forEach((page, index) => {
+        outputPdf.addPage(page)
+        pageMap.set(outputPageNumbers[index], page)
+      })
+      copyPdfMetadata(sourcePdf, outputPdf, sourceRecord.name)
+    }
+    const font = await outputPdf.embedFont(StandardFonts.Helvetica)
+    let textItems = 0
+    for (let index = 0; index < outputPageNumbers.length; index += 1) {
+      if (exportJob.cancelled) throw new Error('Searchable PDF export cancelled.')
+      const sourcePageNumber = outputPageNumbers[index]
+      sendProgress(`Exporting searchable PDF - page ${sourcePageNumber}`, index, sourcePageNumber)
+      const page = exportAllPages ? outputPdf.getPage(sourcePageNumber - 1) : pageMap.get(sourcePageNumber)
+      const ocrResult = ocrByPage.get(sourcePageNumber)
+      if (page && ocrResult) {
+        textItems += drawInvisibleOcrText(page, ocrResult, font)
+      }
+      if (index % 8 === 0) {
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+    }
+    sendProgress('Saving searchable PDF', outputPageNumbers.length, null)
+    outputPdf.setProducer('Next PDF Viewer')
+    outputPdf.setModificationDate(new Date())
+    const searchableBytes = await outputPdf.save({ addDefaultPage: false })
+    await fs.writeFile(outputPath, searchableBytes)
+
+    sendProgress('Verifying searchable text', outputPageNumbers.length, null)
+    const firstOcrOutputIndex = outputPageNumbers.findIndex((pageNumber) => ocrByPage.has(pageNumber))
+    const firstOcrSourcePage = firstOcrOutputIndex >= 0 ? outputPageNumbers[firstOcrOutputIndex] : pagesWithOcr[0]
+    const verifiedText = await verifySearchablePdfText(
+      outputPath,
+      firstOcrOutputIndex >= 0 ? firstOcrOutputIndex + 1 : 1,
+      ocrByPage.get(firstOcrSourcePage)?.text,
+    )
+    const openedPdf = await loadPdf(outputPath)
+    const choice = await dialog.showMessageBox(mainWindow ?? undefined, {
+      type: verifiedText ? 'info' : 'warning',
+      title: 'Searchable PDF Created',
+      message: 'Searchable PDF created successfully.',
+      detail: verifiedText
+        ? outputPath
+        : `${outputPath}\n\nThe file was created, but automatic text verification could not confirm embedded OCR text.`,
+      buttons: ['Open PDF', 'Reveal in Folder', 'Close'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+    })
+    if (choice.response === 1) {
+      shell.showItemInFolder(outputPath)
+      return { outputPath, openedPdf: null, pagesExported: outputPageNumbers.length, textItems, verifiedText }
+    }
+    if (choice.response === 0) {
+      return { outputPath, openedPdf, pagesExported: outputPageNumbers.length, textItems, verifiedText }
+    }
+    return { outputPath, openedPdf: null, pagesExported: outputPageNumbers.length, textItems, verifiedText }
+  } finally {
+    activeSearchablePdfExports.delete(operationId)
+  }
+}
+
+function groupPreferredOcrResultsByPage(results, preferredLanguage) {
+  const grouped = new Map()
+  for (const result of results) {
+    if (result.status !== 'complete' || !String(result.text ?? '').trim()) continue
+    const previous = grouped.get(result.pageNumber)
+    if (!previous) {
+      grouped.set(result.pageNumber, result)
+      continue
+    }
+    if (result.language === preferredLanguage && previous.language !== preferredLanguage) {
+      grouped.set(result.pageNumber, result)
+      continue
+    }
+    if (result.language === previous.language && Date.parse(result.updatedAt) > Date.parse(previous.updatedAt)) {
+      grouped.set(result.pageNumber, result)
+    }
+  }
+  return grouped
+}
+
+function copyPdfMetadata(sourcePdf, outputPdf, fallbackName) {
+  outputPdf.setTitle(sourcePdf.getTitle?.() || path.basename(fallbackName, '.pdf'))
+  const author = sourcePdf.getAuthor?.()
+  const subject = sourcePdf.getSubject?.()
+  const keywords = sourcePdf.getKeywords?.()
+  const creator = sourcePdf.getCreator?.()
+  const producer = sourcePdf.getProducer?.()
+  const creationDate = sourcePdf.getCreationDate?.()
+  if (author) outputPdf.setAuthor(author)
+  if (subject) outputPdf.setSubject(subject)
+  if (keywords?.length) outputPdf.setKeywords(Array.isArray(keywords) ? keywords : String(keywords).split(/[;,]/).map((item) => item.trim()).filter(Boolean))
+  if (creator) outputPdf.setCreator(creator)
+  if (producer) outputPdf.setProducer(producer)
+  if (creationDate) outputPdf.setCreationDate(creationDate)
+  outputPdf.setModificationDate(new Date())
+}
+
+function drawInvisibleOcrText(page, ocrResult, font) {
+  const sourceItems = ocrResult.words.length > 0 ? ocrResult.words : ocrResult.lines
+  if (sourceItems.length === 0) return 0
+  let drawn = 0
+  for (const item of sourceItems) {
+    const text = String(item.text ?? '').trim()
+    if (!text) continue
+    const box = ocrItemToPdfBox(page, item, ocrResult)
+    if (box.width <= 0 || box.height <= 0) continue
+    const fontSize = Math.max(2, Math.min(72, box.height * 0.82))
+    page.drawText(text, {
+      x: box.x,
+      y: box.y + Math.max(0, (box.height - fontSize) / 2),
+      size: fontSize,
+      font,
+      color: rgb(0, 0, 0),
+      opacity: 0,
+      maxWidth: Math.max(1, box.width),
+    })
+    drawn += 1
+  }
+  return drawn
+}
+
+function ocrItemToPdfBox(page, item, ocrResult) {
+  const { width: pageWidth, height: pageHeight } = page.getSize()
+  const imageWidth = Math.max(1, Number(ocrResult.imageWidth) || Number(item.x1) || pageWidth)
+  const imageHeight = Math.max(1, Number(ocrResult.imageHeight) || Number(item.y1) || pageHeight)
+  const visualRect = {
+    x: Math.max(0, Number(item.x0) || 0) / imageWidth,
+    y: Math.max(0, Number(item.y0) || 0) / imageHeight,
+    width: Math.max(0, (Number(item.x1) || 0) - (Number(item.x0) || 0)) / imageWidth,
+    height: Math.max(0, (Number(item.y1) || 0) - (Number(item.y0) || 0)) / imageHeight,
+  }
+  const baseRect = transformUnitRectangle(visualRect, normalizeDegrees(360 - ocrResult.pageRotation))
+  return {
+    x: baseRect.x * pageWidth,
+    y: pageHeight - ((baseRect.y + baseRect.height) * pageHeight),
+    width: baseRect.width * pageWidth,
+    height: baseRect.height * pageHeight,
+  }
+}
+
+function transformUnitRectangle(rectangle, rotation) {
+  if (rotation === 90) {
+    return {
+      x: 1 - rectangle.y - rectangle.height,
+      y: rectangle.x,
+      width: rectangle.height,
+      height: rectangle.width,
+    }
+  }
+  if (rotation === 180) {
+    return {
+      x: 1 - rectangle.x - rectangle.width,
+      y: 1 - rectangle.y - rectangle.height,
+      width: rectangle.width,
+      height: rectangle.height,
+    }
+  }
+  if (rotation === 270) {
+    return {
+      x: rectangle.y,
+      y: 1 - rectangle.x - rectangle.width,
+      width: rectangle.height,
+      height: rectangle.width,
+    }
+  }
+  return rectangle
+}
+
+async function verifySearchablePdfText(outputPath, pageNumber, expectedText) {
+  try {
+    const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
+    const data = new Uint8Array(await fs.readFile(outputPath))
+    const loadingTask = pdfjs.getDocument({ data, disableWorker: true })
+    const document = await loadingTask.promise
+    const page = await document.getPage(Math.max(1, Math.trunc(Number(pageNumber) || 1)))
+    const content = await page.getTextContent()
+    const extracted = content.items.map((item) => 'str' in item ? item.str : '').join(' ').replace(/\s+/g, ' ').trim()
+    await document.destroy()
+    if (!extracted) return false
+    const expectedToken = String(expectedText ?? '').match(/[\p{L}\p{N}]{3,}/u)?.[0]
+    return expectedToken ? extracted.toLocaleLowerCase().includes(expectedToken.toLocaleLowerCase()) : true
+  } catch (error) {
+    console.warn('Searchable PDF verification failed:', error instanceof Error ? error.message : String(error))
+    return false
+  }
+}
+
 function drawFillSignField(page, field, font) {
   const box = visualFieldToPdfBox(page, field)
   const color = fillSignPdfColor(field.color)
@@ -3614,6 +3922,15 @@ ipcMain.handle('ocr:cancel-page', async (_event, operationId) => {
   activeOcrJobs.delete(operationId)
   await job.worker?.terminate().catch(() => undefined)
 })
+
+ipcMain.handle('pdf:cancel-searchable-export', async (_event, operationId) => {
+  const job = activeSearchablePdfExports.get(String(operationId ?? ''))
+  if (job) job.cancelled = true
+})
+
+ipcMain.handle('pdf:export-searchable', (event, options) =>
+  exportSearchablePdf(event, options ?? {}),
+)
 
 ipcMain.handle('ocr:run-page', async (event, request) => {
   const operationId = String(request?.operationId ?? randomUUID()).slice(0, 120)

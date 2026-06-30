@@ -260,6 +260,16 @@ type OcrJobState = {
   paused: boolean
 }
 
+type SearchablePdfExportJob = {
+  operationId: string
+  status: string
+  pageNumber: number | null
+  completedPages: number
+  totalPages: number
+  progress: number
+  estimatedRemainingMs: number | null
+}
+
 type SearchProgress = {
   processed: number
   total: number
@@ -454,6 +464,8 @@ function App() {
   const [currentPageTextStatus, setCurrentPageTextStatus] =
     useState<'unknown' | 'searchable' | 'empty'>('unknown')
   const [ocrJob, setOcrJob] = useState<OcrJobState | null>(null)
+  const [searchablePdfExportJob, setSearchablePdfExportJob] =
+    useState<SearchablePdfExportJob | null>(null)
   const [highlights, setHighlights] = useState<PdfHighlight[]>([])
   const [signaturePlacements, setSignaturePlacements] = useState<SignaturePlacement[]>([])
   const [fillSignFields, setFillSignFields] = useState<FillSignField[]>([])
@@ -1501,6 +1513,15 @@ function App() {
           status: progress.status,
           progress: progress.progress,
         }
+      })
+    })
+  }, [])
+
+  useEffect(() => {
+    return window.electronAPI.onSearchablePdfExportProgress((progress) => {
+      setSearchablePdfExportJob((current) => {
+        if (!current || current.operationId !== progress.operationId) return current
+        return progress
       })
     })
   }, [])
@@ -5616,6 +5637,107 @@ function App() {
     }
   }
 
+  async function exportSearchablePdf(scope: 'current' | 'selected' | 'entire') {
+    closeToolbarMenu()
+    setPdfToolsMenuOpen(false)
+    const document = splitEnabled && activePane === 'right' ? rightDocument : pdfFile
+    const totalPages = splitEnabled && activePane === 'right' ? rightViewStatus.totalPages : numPages
+    const activePage = splitEnabled && activePane === 'right' ? rightViewStatus.page : currentPageRef.current
+    if (!document || searchablePdfExportJob) {
+      return
+    }
+
+    let pageNumbers: number[] | undefined
+    if (scope === 'current') {
+      pageNumbers = [activePage]
+    } else if (scope === 'selected') {
+      const ranges = window.prompt('Enter pages to export as searchable PDF', ocrPageRangeInput || '1-5,10,20-30')
+      if (ranges === null) return
+      try {
+        pageNumbers = parsePageRanges(ranges, totalPages)
+        setOcrPageRangeInput(ranges)
+      } catch (error) {
+        setErrorMessage(getErrorMessage(error))
+        return
+      }
+    }
+
+    const cachedOcr = splitEnabled && activePane === 'right'
+      ? await window.electronAPI.listPageOcrResults(document.id).catch(() => [])
+      : pageOcrResults
+    const completedOcrPages = new Set(
+      cachedOcr
+        .filter((result) => result.status === 'complete' && result.text.trim())
+        .map((result) => result.pageNumber),
+    )
+    const candidatePages = scope === 'entire'
+      ? Array.from({ length: totalPages }, (_value, index) => index + 1)
+      : pageNumbers ?? []
+    if (!candidatePages.some((pageNumber) => completedOcrPages.has(pageNumber))) {
+      setErrorMessage('No OCR data available.')
+      return
+    }
+
+    const operationId = crypto.randomUUID()
+    setErrorMessage(null)
+    setSearchablePdfExportJob({
+      operationId,
+      status: 'Exporting searchable PDF',
+      pageNumber: null,
+      completedPages: 0,
+      totalPages: candidatePages.length,
+      progress: 0,
+      estimatedRemainingMs: null,
+    })
+    setLoadingProgress('Exporting searchable PDF')
+    try {
+      const result = await window.electronAPI.exportSearchablePdf({
+        operationId,
+        identity: {
+          id: document.id,
+          fileSize: document.fileSize,
+          modifiedAt: document.modifiedAt,
+        },
+        scope,
+        pageNumbers,
+        language: ocrLanguage,
+        coverageMode: 'ask',
+      })
+      if (result?.openedPdf) {
+        openResultInTab(result.openedPdf, { targetPane: splitEnabled ? activePane : 'left' })
+      }
+      await refreshRecentFiles()
+      if (result?.outputPath) {
+        setLoadingProgress(
+          result.verifiedText
+            ? 'Searchable PDF created and verified.'
+            : 'Searchable PDF created. Verification could not confirm embedded text.',
+        )
+        window.setTimeout(() => setLoadingProgress(null), 2600)
+      } else {
+        setLoadingProgress(null)
+      }
+    } catch (error) {
+      setErrorMessage(`Searchable PDF export failed: ${getErrorMessage(error)}`)
+      setLoadingProgress(null)
+    } finally {
+      setSearchablePdfExportJob(null)
+    }
+  }
+
+  async function cancelSearchablePdfExport() {
+    if (!searchablePdfExportJob) return
+    try {
+      await window.electronAPI.cancelSearchablePdfExport(searchablePdfExportJob.operationId)
+      setLoadingProgress('Searchable PDF export cancelled')
+      window.setTimeout(() => setLoadingProgress(null), 1600)
+    } catch (error) {
+      setErrorMessage(`Could not cancel searchable PDF export: ${getErrorMessage(error)}`)
+    } finally {
+      setSearchablePdfExportJob(null)
+    }
+  }
+
   function toggleOcrPause() {
     ocrBatchPausedRef.current = !ocrBatchPausedRef.current
     setOcrJob((current) => current ? { ...current, paused: ocrBatchPausedRef.current } : current)
@@ -6419,11 +6541,48 @@ function App() {
                   </select>
                 </label>
                 <div className="my-1 border-t border-slate-700" />
+                <p className="px-3 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">
+                  Export
+                </p>
+                <ToolbarMenuItem
+                  disabled={!(splitEnabled && activePane === 'right' ? rightDocument : pdfFile) || Boolean(searchablePdfExportJob)}
+                  onClick={() => void exportSearchablePdf('current')}
+                  icon={<DocumentBulletListRegular className="size-4" />}
+                >
+                  Export Current Page Searchable
+                </ToolbarMenuItem>
+                <ToolbarMenuItem
+                  disabled={!(splitEnabled && activePane === 'right' ? rightDocument : pdfFile) || Boolean(searchablePdfExportJob)}
+                  onClick={() => void exportSearchablePdf('selected')}
+                  icon={<DocumentBulletListRegular className="size-4" />}
+                >
+                  Export Selected Pages Searchable
+                </ToolbarMenuItem>
+                <ToolbarMenuItem
+                  disabled={!(splitEnabled && activePane === 'right' ? rightDocument : pdfFile) || Boolean(searchablePdfExportJob)}
+                  onClick={() => void exportSearchablePdf('entire')}
+                  icon={<DocumentBulletListRegular className="size-4" />}
+                >
+                  Export Searchable PDF
+                </ToolbarMenuItem>
+                <div className="my-1 border-t border-slate-700" />
                 <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Document Properties</ToolbarMenuItem>
                 <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Repair Missing Files</ToolbarMenuItem>
               </ToolbarMenuPanel>
             ) : null}
           </div>
+
+          {pdfFile && ocrTextPageCount > 0 && ocrDetection.status === 'ocr-recommended' ? (
+            <ToolbarIconButton
+              label="Export searchable PDF"
+              title="Export Searchable PDF"
+              onClick={() => void exportSearchablePdf('entire')}
+              disabled={Boolean(searchablePdfExportJob)}
+              active={Boolean(searchablePdfExportJob)}
+            >
+              <DocumentBulletListRegular className="size-5" />
+            </ToolbarIconButton>
+          ) : null}
 
           <div data-toolbar-menu-scope="" className="relative shrink-0">
             <ToolbarMenuButton
@@ -6679,6 +6838,27 @@ function App() {
                 >
                   <SignatureToolIcon />
                   <span>Signature Manager</span>
+                </button>
+                <div className="my-1 border-t border-slate-700" />
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={!(splitEnabled && activePane === 'right' ? rightDocument : pdfFile) || Boolean(searchablePdfExportJob)}
+                  onClick={() => void exportSearchablePdf('entire')}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold text-slate-200 transition-colors duration-150 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <DocumentBulletListRegular className="size-4" />
+                  <span>Export Searchable PDF</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={!(splitEnabled && activePane === 'right' ? rightDocument : pdfFile) || Boolean(searchablePdfExportJob)}
+                  onClick={() => void exportSearchablePdf('current')}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold text-slate-200 transition-colors duration-150 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <DocumentBulletListRegular className="size-4" />
+                  <span>Export Current Page Searchable</span>
                 </button>
               </div>
             ) : null}
@@ -7540,6 +7720,8 @@ function App() {
                 <p className="font-medium">
                   {ocrJob
                     ? `${ocrJob.status} (${Math.round(ocrJob.progress * 100)}%)`
+                    : searchablePdfExportJob
+                      ? `${searchablePdfExportJob.status} (${Math.round(searchablePdfExportJob.progress * 100)}%)`
                     : loadingProgress}
                 </p>
                 {ocrJob ? (
@@ -7549,8 +7731,22 @@ function App() {
                     {ocrJob.estimatedRemainingMs ? ` | ETA ${formatDurationLong(ocrJob.estimatedRemainingMs)}` : ''}
                     {ocrJob.paused ? ' | Paused' : ''}
                   </p>
+                ) : searchablePdfExportJob ? (
+                  <>
+                    <p className="mt-0.5 text-xs text-blue-200/75">
+                      {searchablePdfExportJob.pageNumber ? `Page ${searchablePdfExportJob.pageNumber} | ` : ''}
+                      {searchablePdfExportJob.completedPages} / {searchablePdfExportJob.totalPages} pages
+                      {searchablePdfExportJob.estimatedRemainingMs ? ` | ETA ${formatDurationLong(searchablePdfExportJob.estimatedRemainingMs)}` : ''}
+                    </p>
+                    <div className="mt-2 h-1.5 w-64 max-w-full overflow-hidden rounded-full bg-blue-950">
+                      <div
+                        className="h-full rounded-full bg-blue-300 transition-[width] duration-150"
+                        style={{ width: `${Math.round(searchablePdfExportJob.progress * 100)}%` }}
+                      />
+                    </div>
+                  </>
                 ) : null}
-                {numPages >= 200 && !ocrJob ? (
+                {numPages >= 200 && !ocrJob && !searchablePdfExportJob ? (
                   <p className="mt-0.5 text-xs text-blue-200/70">
                     Large document mode is rendering only pages near the viewport.
                   </p>
@@ -7574,6 +7770,14 @@ function App() {
                   Cancel
                 </button>
               </div>
+            ) : searchablePdfExportJob ? (
+              <button
+                type="button"
+                onClick={() => void cancelSearchablePdfExport()}
+                className="rounded-lg border border-blue-300/40 px-3 py-1 text-xs font-semibold text-blue-100 hover:bg-blue-500/15"
+              >
+                Cancel
+              </button>
             ) : null}
           </div>
         ) : null}

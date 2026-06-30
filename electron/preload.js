@@ -84,6 +84,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   listPageOcrResults: (documentId) => ipcRenderer.invoke('ocr:list-page-results', documentId),
   runPageOcr: (request) => ipcRenderer.invoke('ocr:run-page', request),
   cancelPageOcr: (operationId) => ipcRenderer.invoke('ocr:cancel-page', operationId),
+  exportSearchablePdf: (options) => ipcRenderer.invoke('pdf:export-searchable', options),
+  cancelSearchablePdfExport: (operationId) => ipcRenderer.invoke('pdf:cancel-searchable-export', operationId),
+  onSearchablePdfExportProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress)
+    ipcRenderer.on('pdf:searchable-export-progress', listener)
+    return () => ipcRenderer.removeListener('pdf:searchable-export-progress', listener)
+  },
   onPageOcrProgress: (callback) => {
     const listener = (_event, progress) => callback(progress)
     ipcRenderer.on('ocr:page-progress', listener)
