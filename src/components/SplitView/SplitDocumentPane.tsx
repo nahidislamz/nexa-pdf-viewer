@@ -12,6 +12,7 @@ import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { FillSignOverlay } from '../Viewer/FillSignOverlay'
 import { HighlightOverlay } from '../Viewer/HighlightOverlay'
 import { HighlightSelectionToolbar } from '../Viewer/HighlightSelectionToolbar'
+import { OcrTextLayer, selectOcrLayerResult, type OcrTextLayerResult } from '../Viewer/OcrTextLayer'
 import { SignaturePlacementOverlay } from '../Viewer/SignaturePlacementOverlay'
 import { PdfPaneHeader, PdfPaneToolbar } from './PdfPaneChrome'
 import type { HighlightColor, PdfHighlight } from '../../types/highlights'
@@ -85,11 +86,20 @@ type SearchMatch = {
   pageNumber: number
   start: number
   end: number
+  source: 'pdf' | 'ocr'
+  language?: OcrLanguage
 }
 
 type CachedPageText = {
   text: string
   starts: number[]
+}
+
+type OcrLanguage = 'eng' | 'ben' | 'ara' | 'hin' | 'urd' | 'fra' | 'deu' | 'spa'
+
+type PageOcrResult = OcrTextLayerResult & {
+  createdAt: string
+  error?: string
 }
 
 type OutlineItem = {
@@ -125,6 +135,7 @@ type Props = {
   onSearchStatus: (status: { current: number; total: number; query: string }) => void
   onViewStatus: (status: { page: number; totalPages: number; zoom: number; fitMode: boolean }) => void
   onScrollPosition: (position: Omit<SplitScrollPosition, 'token'>) => void
+  showOcrConfidence: boolean
 }
 
 const MIN_ZOOM = 0.25
@@ -168,6 +179,7 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
       onSearchStatus,
       onViewStatus,
       onScrollPosition,
+      showOcrConfidence,
     },
     ref,
   ) {
@@ -186,6 +198,7 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
     const [searchMatches, setSearchMatches] = useState<SearchMatch[]>([])
     const [selectedMatchIndex, setSelectedMatchIndex] = useState(-1)
     const [isSearching, setIsSearching] = useState(false)
+    const [pageOcrResults, setPageOcrResults] = useState<PageOcrResult[]>([])
     const [renderedPages, setRenderedPages] = useState<Set<number>>(
       () => new Set([Math.max(1, initialState.page)]),
     )
@@ -238,6 +251,16 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
       return grouped
     }, [searchMatches])
 
+    const pageOcrResultsByPage = useMemo(() => {
+      const grouped = new Map<number, PageOcrResult[]>()
+      for (const result of pageOcrResults) {
+        const pageResults = grouped.get(result.pageNumber) ?? []
+        pageResults.push(result)
+        grouped.set(result.pageNumber, pageResults)
+      }
+      return grouped
+    }, [pageOcrResults])
+
     const highlightsByPage = useMemo(() => {
       const grouped = new Map<number, PdfHighlight[]>()
       for (const highlight of highlights) {
@@ -271,7 +294,7 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
       ({ pageNumber, itemIndex, str }: { pageNumber: number; itemIndex: number; str: string }) => {
         const pageText = pageTextCache.current.get(pageNumber)
         const itemStart = pageText?.starts[itemIndex]
-        const pageMatches = matchesByPage.get(pageNumber)
+        const pageMatches = matchesByPage.get(pageNumber)?.filter((match) => match.source === 'pdf')
         if (!pageText || itemStart === undefined || !pageMatches?.length) {
           return escapeHtml(str)
         }
@@ -487,6 +510,25 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
     }, [pdf, rotation])
 
     useEffect(() => {
+      let cancelled = false
+      setPageOcrResults([])
+      void window.electronAPI.listPageOcrResults(pdfFile.id)
+        .then((results) => {
+          if (!cancelled) {
+            setPageOcrResults(results)
+          }
+        })
+        .catch((reason) => {
+          if (!cancelled) {
+            console.warn('Split pane OCR cache load failed:', getErrorMessage(reason))
+          }
+        })
+      return () => {
+        cancelled = true
+      }
+    }, [pdfFile.id])
+
+    useEffect(() => {
       if (!pdf) return
       const controller = new AbortController()
       const timeout = window.setTimeout(() => {
@@ -540,8 +582,28 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
                   pageNumber,
                   start,
                   end: start + normalizedQuery.length,
+                  source: 'pdf',
                 })
                 start = normalizedText.indexOf(normalizedQuery, start + normalizedQuery.length)
+              }
+              const ocrResults = pageOcrResultsByPage.get(pageNumber) ?? []
+              for (const ocrResult of ocrResults) {
+                if (ocrResult.status !== 'complete' || !ocrResult.text.trim()) {
+                  continue
+                }
+                const normalizedOcrText = ocrResult.text.toLocaleLowerCase()
+                let ocrStart = normalizedOcrText.indexOf(normalizedQuery)
+                while (ocrStart >= 0) {
+                  matches.push({
+                    index: matches.length,
+                    pageNumber,
+                    start: ocrStart,
+                    end: ocrStart + normalizedQuery.length,
+                    source: 'ocr',
+                    language: ocrResult.language,
+                  })
+                  ocrStart = normalizedOcrText.indexOf(normalizedQuery, ocrStart + normalizedQuery.length)
+                }
               }
               if (pageNumber % 8 === 0) {
                 await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
@@ -574,7 +636,7 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
         })()
       }, 180)
       return () => window.clearTimeout(timeout)
-    }, [onSearchStatus, pdf, searchOpen, searchQuery])
+    }, [onSearchStatus, pageOcrResultsByPage, pdf, searchOpen, searchQuery])
 
     useEffect(() => {
       const root = rootRef.current
@@ -1221,7 +1283,9 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
                 onLoadError={(reason) => setError(getErrorMessage(reason))}
               >
                 <div className="flex min-w-full flex-col gap-3">
-                  {Array.from({ length: numPages }, (_, index) => index + 1).map((pageNumber) => (
+                  {Array.from({ length: numPages }, (_, index) => index + 1).map((pageNumber) => {
+                    const pageOcrResult = selectOcrLayerResult(pageOcrResultsByPage.get(pageNumber) ?? [], 'eng')
+                    return (
                     <div
                       key={pageNumber}
                       ref={(element) => {
@@ -1270,19 +1334,30 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
                           onFinishTool={onFinishFillSignTool}
                         />
                         {renderedPages.has(pageNumber) ? (
-                          <PanePage
-                            pageNumber={pageNumber}
-                            scale={renderZoom}
-                            rotation={rotation}
-                            customTextRenderer={searchMatches.length ? renderSearchText : undefined}
-                            onLoad={(page) => {
-                              if (pageNumber === 1) {
-                                const viewport = page.getViewport({ scale: 1, rotation: normalizeRotation(page.rotate + rotation) })
-                                setPageWidth(viewport.width)
-                                setPageHeight(viewport.height)
-                              }
-                            }}
-                          />
+                          <>
+                            <PanePage
+                              pageNumber={pageNumber}
+                              scale={renderZoom}
+                              rotation={rotation}
+                              customTextRenderer={searchMatches.length ? renderSearchText : undefined}
+                              onLoad={(page) => {
+                                if (pageNumber === 1) {
+                                  const viewport = page.getViewport({ scale: 1, rotation: normalizeRotation(page.rotate + rotation) })
+                                  setPageWidth(viewport.width)
+                                  setPageHeight(viewport.height)
+                                }
+                              }}
+                            />
+                            {pageOcrResult ? (
+                              <OcrTextLayer
+                                result={pageOcrResult}
+                                rotation={rotation}
+                                matches={matchesByPage.get(pageNumber) ?? []}
+                                showConfidence={showOcrConfidence}
+                                searchMatchAttribute="data-split-search-match"
+                              />
+                            ) : null}
+                          </>
                         ) : (
                           <div className="grid bg-slate-800 text-xs text-slate-500" style={{ width: pageWidth * renderZoom, height: pageHeight * renderZoom }}>
                             <span className="m-auto">Page {pageNumber}</span>
@@ -1290,7 +1365,8 @@ export const SplitDocumentPane = forwardRef<SplitDocumentPaneHandle, Props>(
                         )}
                       </div>
                     </div>
-                  ))}
+                    )
+                  })}
                 </div>
               </Document>
             </div>

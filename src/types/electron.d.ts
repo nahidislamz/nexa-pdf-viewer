@@ -38,6 +38,9 @@ type PageOcrResult = {
   pageNumber: number
   text: string
   confidence: number
+  imageWidth: number
+  imageHeight: number
+  pageRotation: number
   words: Array<{ text: string; confidence: number; x0: number; y0: number; x1: number; y1: number }>
   lines: Array<{ text: string; confidence: number; x0: number; y0: number; x1: number; y1: number }>
   language: OcrLanguage
@@ -334,6 +337,9 @@ declare global {
         pageNumber: number
         language: OcrLanguage
         imageDataUrl: string
+        imageWidth?: number
+        imageHeight?: number
+        pageRotation?: number
         force?: boolean
       }) => Promise<PageOcrResult>
       cancelPageOcr: (operationId: string) => Promise<void>

@@ -47,6 +47,7 @@ import { HighlightOverlay } from './components/Viewer/HighlightOverlay'
 import { HighlightSelectionToolbar } from './components/Viewer/HighlightSelectionToolbar'
 import { FillSignOverlay } from './components/Viewer/FillSignOverlay'
 import { SignaturePlacementOverlay } from './components/Viewer/SignaturePlacementOverlay'
+import { OcrTextLayer, selectOcrLayerResult } from './components/Viewer/OcrTextLayer'
 import { GlobalHighlightsDashboard } from './components/Highlights/GlobalHighlightsDashboard'
 import { GlobalSearchPanel } from './components/Search/GlobalSearchPanel'
 import { WorkspaceManager } from './components/Workspaces/WorkspaceManager'
@@ -232,6 +233,9 @@ type PageOcrResult = {
   pageNumber: number
   text: string
   confidence: number
+  imageWidth: number
+  imageHeight: number
+  pageRotation: number
   words: Array<{ text: string; confidence: number; x0: number; y0: number; x1: number; y1: number }>
   lines: Array<{ text: string; confidence: number; x0: number; y0: number; x1: number; y1: number }>
   language: OcrLanguage
@@ -714,6 +718,9 @@ function App() {
   const lowConfidenceOcrPageCount = useMemo(
     () => new Set(pageOcrResults.filter((result) => result.status === 'complete' && result.lowConfidence).map((result) => result.pageNumber)).size,
     [pageOcrResults],
+  )
+  const [showOcrConfidence, setShowOcrConfidence] = useState(
+    () => window.localStorage.getItem('next-pdf-viewer:show-ocr-confidence') === 'true',
   )
 
   const renderSearchText = useCallback(
@@ -1501,6 +1508,10 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem('next-pdf-viewer:ocr-language', ocrLanguage)
   }, [ocrLanguage])
+
+  useEffect(() => {
+    window.localStorage.setItem('next-pdf-viewer:show-ocr-confidence', String(showOcrConfidence))
+  }, [showOcrConfidence])
 
   useEffect(() => {
     if (!pdfDocument || !pdfFile) {
@@ -3220,10 +3231,6 @@ function App() {
     if (!match) {
       return
     }
-    if (match.source === 'ocr') {
-      setErrorMessage('OCR text matches can be searched, but cannot be highlighted until OCR text positioning is implemented.')
-      return
-    }
 
     if (currentPageRef.current !== match.pageNumber) {
       goToPage(match.pageNumber, 'auto')
@@ -3233,7 +3240,7 @@ function App() {
       const marks = Array.from(
         document.querySelectorAll<HTMLElement>(`[data-search-match="${match.index}"]`),
       )
-      const page = marks[0]?.closest<HTMLElement>('.react-pdf__Page')
+      const page = marks[0] ? getPdfPageElement(marks[0]) : null
       if (!page || marks.length === 0) {
         if (attempt < 90) {
           window.setTimeout(() => highlightSelectedSearchMatch(color, attempt + 1), 16)
@@ -3250,8 +3257,12 @@ function App() {
           height: clampUnit(rectangle.height / pageBounds.height),
         })),
       )
-      const pageText = pageTextCacheRef.current.get(match.pageNumber)
-      const text = pageText?.text.slice(match.start, match.end).trim() || searchQuery.trim()
+      const pageText = match.source === 'ocr'
+        ? pageOcrResultsByPage
+          .get(match.pageNumber)
+          ?.find((result) => result.language === match.language)?.text
+        : pageTextCacheRef.current.get(match.pageNumber)?.text
+      const text = pageText?.slice(match.start, match.end).trim() || searchQuery.trim()
       if (!text || rectangles.length === 0) {
         return
       }
@@ -5408,9 +5419,10 @@ function App() {
   async function renderPageForOcr(pageNumber: number) {
     if (!pdfDocument) throw new Error('No PDF is open.')
     const page = await pdfDocument.getPage(pageNumber)
+    const pageRotation = normalizeRotation(page.rotate + rotation)
     const viewport = page.getViewport({
       scale: 2.5,
-      rotation: normalizeRotation(page.rotate + rotation),
+      rotation: pageRotation,
     })
     const canvas = document.createElement('canvas')
     canvas.width = Math.ceil(viewport.width)
@@ -5426,6 +5438,9 @@ function App() {
     return {
       pageNumber,
       imageDataUrl: canvas.toDataURL('image/png'),
+      imageWidth: canvas.width,
+      imageHeight: canvas.height,
+      pageRotation,
     }
   }
 
@@ -5500,6 +5515,9 @@ function App() {
           pageNumber: renderedPage.pageNumber,
           language: ocrLanguage,
           imageDataUrl: renderedPage.imageDataUrl,
+          imageWidth: renderedPage.imageWidth,
+          imageHeight: renderedPage.imageHeight,
+          pageRotation: renderedPage.pageRotation,
           force,
         })
         completedPages += 1
@@ -6439,6 +6457,12 @@ function App() {
                   toggleSidebar()
                   closeToolbarMenu()
                 }} icon={<PanelLeftRegular className="size-4" />}>Toggle Sidebar</ToolbarMenuItem>
+                <ToolbarMenuItem onClick={() => {
+                  setShowOcrConfidence((visible) => !visible)
+                  closeToolbarMenu()
+                }} icon={<DocumentBulletListRegular className="size-4" />}>
+                  {showOcrConfidence ? 'Hide OCR Confidence' : 'Show OCR Confidence'}
+                </ToolbarMenuItem>
               </ToolbarMenuPanel>
             ) : null}
           </div>
@@ -8042,6 +8066,10 @@ function App() {
                           signaturePlacementsByPage.get(pageNumber) ?? []
                         const pageFillSignFields =
                           fillSignFieldsByPage.get(pageNumber) ?? []
+                        const pageOcrResult = selectOcrLayerResult(
+                          pageOcrResultsByPage.get(pageNumber) ?? [],
+                          ocrLanguage,
+                        )
                         const pageFocusedHighlightId = pageHighlights.some(
                           (highlight) => highlight.id === focusedHighlightId,
                         )
@@ -8146,6 +8174,14 @@ function App() {
                                   height={estimatedPageHeight * renderZoom}
                                 />
                               )}
+                              {shouldRender && pageOcrResult ? (
+                                <OcrTextLayer
+                                  result={pageOcrResult}
+                                  rotation={rotation}
+                                  matches={matchesByPage.get(pageNumber) ?? []}
+                                  showConfidence={showOcrConfidence}
+                                />
+                              ) : null}
                             </div>
                           </div>
                         )
@@ -8215,6 +8251,7 @@ function App() {
                   onSearchStatus={setRightSearchStatus}
                   onViewStatus={setRightViewStatus}
                   onScrollPosition={applyRightScrollToLeft}
+                  showOcrConfidence={showOcrConfidence}
                 />
                 ) : (
                   <section
@@ -9531,6 +9568,10 @@ function highlightCategoryColorClass(category: HighlightCategory) {
 
 function getPdfPageElement(node: Node) {
   const element = node instanceof Element ? node : node.parentElement
+  const ocrLayer = element?.closest<HTMLElement>('[data-ocr-text-layer]')
+  if (ocrLayer) {
+    return ocrLayer.parentElement?.querySelector<HTMLElement>('.react-pdf__Page') ?? null
+  }
   return element?.closest<HTMLElement>('.react-pdf__Page') ?? null
 }
 
