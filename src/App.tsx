@@ -1405,6 +1405,9 @@ function App() {
 
               const ocrResults = pageOcrResultsByPage.get(pageNumber) ?? []
               for (const ocrResult of ocrResults) {
+                if (ocrResult.status !== 'complete' || !ocrResult.text.trim()) {
+                  continue
+                }
                 const normalizedOcrText = ocrResult.text.toLowerCase()
                 let ocrMatchStart = normalizedOcrText.indexOf(normalizedQuery)
                 while (ocrMatchStart !== -1) {
@@ -5662,9 +5665,9 @@ function App() {
       }
     }
 
-    const cachedOcr = splitEnabled && activePane === 'right'
-      ? await window.electronAPI.listPageOcrResults(document.id).catch(() => [])
-      : pageOcrResults
+    const cachedOcr = await window.electronAPI.listPageOcrResults(document.id).catch(() =>
+      splitEnabled && activePane === 'right' ? [] : pageOcrResults,
+    )
     const completedOcrPages = new Set(
       cachedOcr
         .filter((result) => result.status === 'complete' && result.text.trim())
@@ -5718,8 +5721,14 @@ function App() {
         setLoadingProgress(null)
       }
     } catch (error) {
-      setErrorMessage(`Searchable PDF export failed: ${getErrorMessage(error)}`)
-      setLoadingProgress(null)
+      const message = getErrorMessage(error)
+      if (message.toLocaleLowerCase().includes('cancelled')) {
+        setLoadingProgress('Searchable PDF export cancelled')
+        window.setTimeout(() => setLoadingProgress(null), 1600)
+      } else {
+        setErrorMessage(`Searchable PDF export failed: ${message}`)
+        setLoadingProgress(null)
+      }
     } finally {
       setSearchablePdfExportJob(null)
     }
@@ -8597,6 +8606,12 @@ function App() {
               <>
                 <StatusDivider />
                 <StatusItem>OCR {ocrJob.completedPages}/{ocrJob.totalPages} | {ocrJob.failedPages} failed | {Math.round(ocrJob.progress * 100)}%</StatusItem>
+              </>
+            ) : null}
+            {searchablePdfExportJob ? (
+              <>
+                <StatusDivider />
+                <StatusItem>Export searchable PDF {searchablePdfExportJob.completedPages}/{searchablePdfExportJob.totalPages} | {Math.round(searchablePdfExportJob.progress * 100)}%</StatusItem>
               </>
             ) : null}
           </>

@@ -2490,7 +2490,10 @@ function drawInvisibleOcrText(page, ocrResult, font) {
     if (!text) continue
     const box = ocrItemToPdfBox(page, item, ocrResult)
     if (box.width <= 0 || box.height <= 0) continue
-    const fontSize = Math.max(2, Math.min(72, box.height * 0.82))
+    const heightFontSize = Math.max(2, Math.min(72, box.height * 0.82))
+    const textWidthAtUnit = Math.max(0.001, font.widthOfTextAtSize(text, 1))
+    const widthFontSize = Math.max(2, (box.width / textWidthAtUnit) * 0.98)
+    const fontSize = Math.max(2, Math.min(72, heightFontSize, widthFontSize))
     page.drawText(text, {
       x: box.x,
       y: box.y + Math.max(0, (box.height - fontSize) / 2),
