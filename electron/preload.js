@@ -81,6 +81,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   revealPdf: (id) => ipcRenderer.invoke('pdf:reveal', id),
   savePdfState: (id, state) => ipcRenderer.invoke('pdf:save-state', id, state),
   saveOcrDetection: (id, detection) => ipcRenderer.invoke('pdf:save-ocr-detection', id, detection),
+  listPageOcrResults: (documentId) => ipcRenderer.invoke('ocr:list-page-results', documentId),
+  runPageOcr: (request) => ipcRenderer.invoke('ocr:run-page', request),
+  cancelPageOcr: (operationId) => ipcRenderer.invoke('ocr:cancel-page', operationId),
+  onPageOcrProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress)
+    ipcRenderer.on('ocr:page-progress', listener)
+    return () => ipcRenderer.removeListener('ocr:page-progress', listener)
+  },
   savePdfHighlights: (identity, highlights) =>
     ipcRenderer.invoke('pdf:save-highlights', identity, highlights),
   savePdfSignaturePlacements: (identity, placements) =>

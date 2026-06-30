@@ -134,6 +134,8 @@ type SearchMatch = {
   pageNumber: number
   start: number
   end: number
+  source?: 'pdf' | 'ocr'
+  language?: OcrLanguage
 }
 
 type SidebarTab = 'thumbnails' | 'bookmarks' | 'highlights' | 'info'
@@ -224,6 +226,18 @@ type OcrDetectionResult = {
   error?: string
 }
 
+type OcrLanguage = 'eng' | 'ben' | 'ara' | 'hin' | 'urd' | 'fra' | 'deu' | 'spa'
+
+type PageOcrResult = {
+  pageNumber: number
+  text: string
+  confidence: number
+  language: OcrLanguage
+  createdAt: string
+  status: 'complete' | 'failed'
+  error?: string
+}
+
 type SearchProgress = {
   processed: number
   total: number
@@ -243,6 +257,16 @@ const EMPTY_OCR_DETECTION: OcrDetectionResult = {
   textCharacters: 0,
   detectedAt: null,
 }
+const OCR_LANGUAGES: Array<{ code: OcrLanguage; label: string }> = [
+  { code: 'eng', label: 'English' },
+  { code: 'ben', label: 'Bangla' },
+  { code: 'ara', label: 'Arabic' },
+  { code: 'hin', label: 'Hindi' },
+  { code: 'urd', label: 'Urdu' },
+  { code: 'fra', label: 'French' },
+  { code: 'deu', label: 'German' },
+  { code: 'spa', label: 'Spanish' },
+]
 const VIEWER_BACKGROUNDS: Record<ViewerBackground, string> = {
   'dark-gray': '#1f2937',
   black: '#000000',
@@ -400,6 +424,16 @@ function App() {
   const [documentMetadata, setDocumentMetadata] = useState<DocumentMetadata | null>(null)
   const [metadataLoading, setMetadataLoading] = useState(false)
   const [ocrDetection, setOcrDetection] = useState<OcrDetectionResult>(EMPTY_OCR_DETECTION)
+  const [ocrLanguage, setOcrLanguage] = useState<OcrLanguage>('eng')
+  const [pageOcrResults, setPageOcrResults] = useState<PageOcrResult[]>([])
+  const [currentPageTextStatus, setCurrentPageTextStatus] =
+    useState<'unknown' | 'searchable' | 'empty'>('unknown')
+  const [ocrJob, setOcrJob] = useState<{
+    operationId: string
+    pageNumber: number
+    status: string
+    progress: number
+  } | null>(null)
   const [highlights, setHighlights] = useState<PdfHighlight[]>([])
   const [signaturePlacements, setSignaturePlacements] = useState<SignaturePlacement[]>([])
   const [fillSignFields, setFillSignFields] = useState<FillSignField[]>([])
@@ -454,6 +488,7 @@ function App() {
   const [headerHeight, setHeaderHeight] = useState(0)
   const headerRef = useRef<HTMLElement>(null)
   const viewerRef = useRef<HTMLDivElement>(null)
+  const activeDocumentIdRef = useRef<string | null>(null)
   const pageInputFocusedRef = useRef(false)
   const currentPageRef = useRef(1)
   const zoomAnchorRef = useRef<{
@@ -483,6 +518,7 @@ function App() {
   const outlineGenerationRef = useRef(0)
   const metadataGenerationRef = useRef(0)
   const ocrDetectionGenerationRef = useRef(0)
+  const cancelledOcrOperationsRef = useRef(new Set<string>())
   const firstPageProxyRef = useRef<PDFPageProxy | null>(null)
   const pdfDocumentRef = useRef<PDFDocumentProxy | null>(null)
   const navigationTargetRef = useRef<number | null>(null)
@@ -623,6 +659,30 @@ function App() {
     }
     return groupedFields
   }, [fillSignFields])
+  const pageOcrResultsByPage = useMemo(() => {
+    const groupedResults = new Map<number, PageOcrResult[]>()
+    for (const result of pageOcrResults) {
+      if (result.status !== 'complete' || !result.text.trim()) continue
+      const results = groupedResults.get(result.pageNumber) ?? []
+      results.push(result)
+      groupedResults.set(result.pageNumber, results)
+    }
+    return groupedResults
+  }, [pageOcrResults])
+  const currentPageOcrResult = useMemo(
+    () =>
+      pageOcrResults.find(
+        (result) =>
+          result.pageNumber === currentPage &&
+          result.language === ocrLanguage &&
+          result.status === 'complete',
+      ) ?? null,
+    [currentPage, ocrLanguage, pageOcrResults],
+  )
+  const ocrTextPageCount = useMemo(
+    () => new Set(pageOcrResults.filter((result) => result.status === 'complete' && result.text.trim()).map((result) => result.pageNumber)).size,
+    [pageOcrResults],
+  )
 
   const renderSearchText = useCallback(
     ({ pageNumber, itemIndex, str }: { pageNumber: number; itemIndex: number; str: string }) => {
@@ -636,7 +696,7 @@ function App() {
 
       const itemEnd = itemStart + str.length
       const overlappingMatches = pageMatches.filter(
-        (match) => match.start < itemEnd && match.end > itemStart,
+        (match) => (match.source ?? 'pdf') === 'pdf' && match.start < itemEnd && match.end > itemStart,
       )
       if (overlappingMatches.length === 0) {
         return escapeHtml(str)
@@ -1284,11 +1344,32 @@ function App() {
                   pageNumber,
                   start: matchStart,
                   end: matchStart + normalizedQuery.length,
+                  source: 'pdf',
                 })
                 matchStart = normalizedText.indexOf(
                   normalizedQuery,
                   matchStart + normalizedQuery.length,
                 )
+              }
+
+              const ocrResults = pageOcrResultsByPage.get(pageNumber) ?? []
+              for (const ocrResult of ocrResults) {
+                const normalizedOcrText = ocrResult.text.toLowerCase()
+                let ocrMatchStart = normalizedOcrText.indexOf(normalizedQuery)
+                while (ocrMatchStart !== -1) {
+                  matches.push({
+                    index: matches.length,
+                    pageNumber,
+                    start: ocrMatchStart,
+                    end: ocrMatchStart + normalizedQuery.length,
+                    source: 'ocr',
+                    language: ocrResult.language,
+                  })
+                  ocrMatchStart = normalizedOcrText.indexOf(
+                    normalizedQuery,
+                    ocrMatchStart + normalizedQuery.length,
+                  )
+                }
               }
             }
 
@@ -1327,7 +1408,7 @@ function App() {
     }, 180)
 
     return () => window.clearTimeout(timeout)
-  }, [pdfDocument, searchOpen, searchQuery])
+  }, [pageOcrResultsByPage, pdfDocument, searchOpen, searchQuery])
 
   useEffect(() => {
     document
@@ -1364,6 +1445,41 @@ function App() {
       window.cancelAnimationFrame(animationFrame)
     }
   }, [searchMatches, selectedMatchIndex])
+
+  useEffect(() => {
+    return window.electronAPI.onPageOcrProgress((progress) => {
+      setOcrJob((current) =>
+        current?.operationId === progress.operationId
+          ? {
+              ...current,
+              status: progress.status,
+              progress: progress.progress,
+            }
+          : current,
+      )
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!pdfDocument || !pdfFile) {
+      return
+    }
+    let cancelled = false
+    void getPageText(pdfDocument, currentPage, pageTextCacheRef.current)
+      .then((pageText) => {
+        if (!cancelled) {
+          setCurrentPageTextStatus(
+            countMeaningfulTextCharacters(pageText.text) >= 20 ? 'searchable' : 'empty',
+          )
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setCurrentPageTextStatus('unknown')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [currentPage, pdfDocument, pdfFile])
 
   useEffect(() => {
     const viewer = viewerRef.current
@@ -3062,6 +3178,10 @@ function App() {
     if (!match) {
       return
     }
+    if (match.source === 'ocr') {
+      setErrorMessage('OCR text matches can be searched, but cannot be highlighted until OCR text positioning is implemented.')
+      return
+    }
 
     if (currentPageRef.current !== match.pageNumber) {
       goToPage(match.pageNumber, 'auto')
@@ -4579,6 +4699,7 @@ function App() {
     setPdfFile(null)
     setPdfDocument(null)
     setActiveDocumentId(null)
+    activeDocumentIdRef.current = null
     setNumPages(0)
     setCurrentPage(1)
     currentPageRef.current = 1
@@ -4595,6 +4716,9 @@ function App() {
     setDocumentMetadata(null)
     ocrDetectionGenerationRef.current += 1
     setOcrDetection(EMPTY_OCR_DETECTION)
+    setPageOcrResults([])
+    setCurrentPageTextStatus('unknown')
+    setOcrJob(null)
     setIsLoading(false)
     setLoadingProgress(null)
     setIsRestoring(false)
@@ -4885,6 +5009,9 @@ function App() {
     setDocumentMetadata(null)
     setMetadataLoading(false)
     setOcrDetection(normalizeOcrDetection(result.ocrDetection))
+    setPageOcrResults([])
+    setCurrentPageTextStatus('unknown')
+    setOcrJob(null)
     highlightSaveGenerationRef.current += 1
     signaturePlacementSaveGenerationRef.current += 1
     fillSignSaveGenerationRef.current += 1
@@ -4922,6 +5049,7 @@ function App() {
       setSidebarWidth(tabState.sidebarWidth)
     }
     setActiveDocumentId(result.id)
+    activeDocumentIdRef.current = result.id
     displayZoomRef.current = restoredZoom
     renderZoomRef.current = restoredZoom
     setDisplayZoom(restoredZoom)
@@ -4943,7 +5071,19 @@ function App() {
     currentPageRef.current = 1
     setCurrentPage(1)
     setPageInput('1')
+    void refreshPageOcrResults(result.id)
     void logMemoryUsage('PDF open started')
+  }
+
+  async function refreshPageOcrResults(documentId: string) {
+    try {
+      const results = await window.electronAPI.listPageOcrResults(documentId)
+      if (activeDocumentIdRef.current === documentId) {
+        setPageOcrResults(results)
+      }
+    } catch (error) {
+      console.warn('Could not load OCR page results:', getErrorMessage(error))
+    }
   }
 
   async function refreshRecentFiles() {
@@ -5208,15 +5348,109 @@ function App() {
     closeToolbarMenu()
   }
 
-  function showOcrPlaceholder() {
+  async function renderCurrentPageForOcr() {
+    if (!pdfDocument) throw new Error('No PDF is open.')
+    const pageNumber = currentPageRef.current
+    const page = await pdfDocument.getPage(pageNumber)
+    const viewport = page.getViewport({
+      scale: 2.5,
+      rotation: normalizeRotation(page.rotate + rotation),
+    })
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.ceil(viewport.width)
+    canvas.height = Math.ceil(viewport.height)
+    const canvasContext = canvas.getContext('2d')
+    if (!canvasContext) throw new Error('Canvas rendering is unavailable.')
+    await page.render({
+      canvas,
+      canvasContext,
+      viewport,
+      background: '#ffffff',
+    }).promise
+    return {
+      pageNumber,
+      imageDataUrl: canvas.toDataURL('image/png'),
+    }
+  }
+
+  async function runCurrentPageOcr(force = false) {
     closeToolbarMenu()
+    if (!pdfDocument || !pdfFile) {
+      setErrorMessage('Open a PDF before running OCR.')
+      return
+    }
+    if (splitEnabled && activePane === 'right') {
+      setErrorMessage('OCR Current Page is available from the left pane in this pass.')
+      return
+    }
+    if (currentPageOcrResult && !force) {
+      setLoadingProgress('OCR already completed for this page. Choose Run OCR Again to replace it.')
+      window.setTimeout(() => setLoadingProgress(null), 2600)
+      return
+    }
+
     setErrorMessage(null)
-    setLoadingProgress(
-      ocrDetection.status === 'ocr-recommended'
-        ? 'OCR is recommended for this scanned PDF. OCR processing is coming soon.'
-        : 'OCR processing is coming soon.',
-    )
-    window.setTimeout(() => setLoadingProgress(null), 2600)
+    const operationId = crypto.randomUUID()
+    const pageNumber = currentPageRef.current
+    setOcrJob({
+      operationId,
+      pageNumber,
+      status: `OCR running on page ${pageNumber}`,
+      progress: 0,
+    })
+    setLoadingProgress(`OCR running on page ${pageNumber}`)
+
+    try {
+      const renderedPage = await renderCurrentPageForOcr()
+      const result = await window.electronAPI.runPageOcr({
+        operationId,
+        documentId: pdfFile.id,
+        pageNumber: renderedPage.pageNumber,
+        language: ocrLanguage,
+        imageDataUrl: renderedPage.imageDataUrl,
+        force,
+      })
+      setPageOcrResults((current) => [
+        ...current.filter(
+          (candidate) =>
+            !(
+              candidate.pageNumber === result.pageNumber &&
+              candidate.language === result.language
+            ),
+        ),
+        result,
+      ])
+      setOcrDetection((current) => ({
+        ...current,
+        status: current.status === 'searchable' ? current.status : 'ocr-recommended',
+        detectedAt: new Date().toISOString(),
+      }))
+      setLoadingProgress('OCR complete')
+      window.setTimeout(() => setLoadingProgress(null), 2200)
+    } catch (error) {
+      if (cancelledOcrOperationsRef.current.has(operationId)) {
+        cancelledOcrOperationsRef.current.delete(operationId)
+        setLoadingProgress('OCR cancelled')
+        window.setTimeout(() => setLoadingProgress(null), 1500)
+      } else {
+        setErrorMessage(`OCR failed: ${getErrorMessage(error)}`)
+        setLoadingProgress(null)
+      }
+    } finally {
+      setOcrJob(null)
+    }
+  }
+
+  async function cancelCurrentPageOcr() {
+    if (!ocrJob) return
+    try {
+      cancelledOcrOperationsRef.current.add(ocrJob.operationId)
+      await window.electronAPI.cancelPageOcr(ocrJob.operationId)
+      setLoadingProgress(null)
+      setOcrJob(null)
+    } catch (error) {
+      setErrorMessage(`Could not cancel OCR: ${getErrorMessage(error)}`)
+    }
   }
 
   function startFillSignTool(tool: FillSignTool) {
@@ -5918,14 +6152,57 @@ function App() {
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('merge')} icon={<DocumentPdfRegular className="size-4" />}>Merge PDFs</ToolbarMenuItem>
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('images')} icon={<AddRegular className="size-4" />}>Images to PDF</ToolbarMenuItem>
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('signatures')} icon={<SignatureRegular className="size-4" />}>Signature Manager</ToolbarMenuItem>
-                <ToolbarMenuItem
-                  onClick={showOcrPlaceholder}
-                  icon={<DocumentBulletListRegular className="size-4" />}
-                >
-                  {ocrDetection.status === 'ocr-recommended'
-                    ? 'OCR Recommended (Coming Soon)'
-                    : 'OCR (Coming Soon)'}
-                </ToolbarMenuItem>
+                <div className="my-1 border-t border-slate-700" />
+                {currentPageOcrResult ? (
+                  <>
+                    <p className="px-3 py-1 text-xs text-slate-400">
+                      OCR already completed for this page.
+                    </p>
+                    <ToolbarMenuItem
+                      disabled={!pdfDocument || (splitEnabled && activePane === 'right') || Boolean(ocrJob)}
+                      onClick={() => void runCurrentPageOcr(true)}
+                      icon={<DocumentBulletListRegular className="size-4" />}
+                    >
+                      Run OCR Again
+                    </ToolbarMenuItem>
+                  </>
+                ) : currentPageTextStatus === 'searchable' ? (
+                  <>
+                    <p className="px-3 py-1 text-xs text-slate-400">
+                      Current page already has searchable text.
+                    </p>
+                    <ToolbarMenuItem
+                      disabled={!pdfDocument || (splitEnabled && activePane === 'right') || Boolean(ocrJob)}
+                      onClick={() => void runCurrentPageOcr(true)}
+                      icon={<DocumentBulletListRegular className="size-4" />}
+                    >
+                      Run OCR Anyway
+                    </ToolbarMenuItem>
+                  </>
+                ) : (
+                  <ToolbarMenuItem
+                    disabled={!pdfDocument || (splitEnabled && activePane === 'right') || Boolean(ocrJob)}
+                    onClick={() => void runCurrentPageOcr(false)}
+                    icon={<DocumentBulletListRegular className="size-4" />}
+                  >
+                    OCR Current Page
+                  </ToolbarMenuItem>
+                )}
+                <label className="mx-2 my-1 flex items-center justify-between gap-3 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-300">
+                  <span>OCR Language</span>
+                  <select
+                    value={ocrLanguage}
+                    onChange={(event) => setOcrLanguage(event.target.value as OcrLanguage)}
+                    className="max-w-28 rounded bg-slate-950 px-2 py-1 text-slate-100 outline-none"
+                  >
+                    {OCR_LANGUAGES.map((language) => (
+                      <option key={language.code} value={language.code}>
+                        {language.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="my-1 border-t border-slate-700" />
                 <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Document Properties</ToolbarMenuItem>
                 <ToolbarMenuItem disabled icon={<MoreHorizontalRegular className="size-4" />}>Repair Missing Files</ToolbarMenuItem>
               </ToolbarMenuPanel>
@@ -6953,7 +7230,7 @@ function App() {
                 : searchQuery.trim() && searchMatches.length === 0
                   ? 'No results'
                   : searchMatches.length > 0
-                    ? `Match ${selectedMatchIndex + 1} of ${searchMatches.length}`
+                    ? `Match ${selectedMatchIndex + 1} of ${searchMatches.length}${searchMatchSourceLabel(searchMatches[selectedMatchIndex])}`
                     : ''}
             </span>
             {splitEnabled && searchBothPanes ? (
@@ -7033,17 +7310,32 @@ function App() {
         {loadingProgress ? (
           <div
             role="status"
-            className="mb-3 flex items-center gap-3 rounded-xl border border-blue-500/30 bg-blue-950/35 px-4 py-3 text-sm text-blue-100"
+            className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-blue-500/30 bg-blue-950/35 px-4 py-3 text-sm text-blue-100"
           >
-            <span className="size-4 animate-spin rounded-full border-2 border-blue-300/30 border-t-blue-300" />
-            <div>
-              <p className="font-medium">{loadingProgress}</p>
-              {numPages >= 200 ? (
-                <p className="mt-0.5 text-xs text-blue-200/70">
-                  Large document mode is rendering only pages near the viewport.
+            <div className="flex min-w-0 items-center gap-3">
+              <span className="size-4 shrink-0 animate-spin rounded-full border-2 border-blue-300/30 border-t-blue-300" />
+              <div className="min-w-0">
+                <p className="font-medium">
+                  {ocrJob
+                    ? `${ocrJob.status} (${Math.round(ocrJob.progress * 100)}%)`
+                    : loadingProgress}
                 </p>
-              ) : null}
+                {numPages >= 200 && !ocrJob ? (
+                  <p className="mt-0.5 text-xs text-blue-200/70">
+                    Large document mode is rendering only pages near the viewport.
+                  </p>
+                ) : null}
+              </div>
             </div>
+            {ocrJob ? (
+              <button
+                type="button"
+                onClick={() => void cancelCurrentPageOcr()}
+                className="shrink-0 rounded-lg border border-blue-300/40 px-3 py-1 text-xs font-semibold text-blue-100 hover:bg-blue-500/15"
+              >
+                Cancel
+              </button>
+            ) : null}
           </div>
         ) : null}
 
@@ -7323,6 +7615,7 @@ function App() {
                   metadata={documentMetadata}
                   loading={metadataLoading}
                   ocrDetection={ocrDetection}
+                  ocrTextPages={ocrTextPageCount}
                 />
               ) : null}
 
@@ -7812,7 +8105,7 @@ function App() {
             {(!splitEnabled || activePane === 'left') && pdfFile ? (
               <>
                 <StatusDivider />
-                <StatusItem>{ocrDetectionLabel(ocrDetection)}</StatusItem>
+                <StatusItem>{ocrTextPagesStatus(ocrDetection, ocrTextPageCount)}</StatusItem>
               </>
             ) : null}
             {(splitEnabled && activePane === 'right' ? rightPaneState?.searchOpen : searchOpen) ? (
@@ -7830,7 +8123,7 @@ function App() {
                         ? `Searching ${searchProgress.processed} of ${searchProgress.total}`
                         : 'Searching...'
                       : searchMatches.length > 0
-                        ? `Match ${selectedMatchIndex + 1} of ${searchMatches.length}`
+                        ? `Match ${selectedMatchIndex + 1} of ${searchMatches.length}${searchMatchSourceLabel(searchMatches[selectedMatchIndex])}`
                         : searchQuery.trim()
                           ? 'No results'
                           : 'Search active'}
@@ -8571,19 +8864,22 @@ function DocumentInfoPanel({
   metadata,
   loading,
   ocrDetection,
+  ocrTextPages,
 }: {
   file: PdfFile
   totalPages: number
   metadata: DocumentMetadata | null
   loading: boolean
   ocrDetection: OcrDetectionResult
+  ocrTextPages: number
 }) {
   const rows = [
     ['File name', file.name],
     ['File path', file.filePath],
     ['File size', formatFileSize(file.fileSize)],
     ['Total pages', String(totalPages)],
-    ['OCR status', ocrDetectionLabel(ocrDetection)],
+    ['OCR status', ocrTextPages > 0 ? 'Scanned PDF - OCR Text Available' : ocrDetectionLabel(ocrDetection)],
+    ['OCR text pages', ocrTextPages > 0 ? String(ocrTextPages) : 'None'],
     ['Title', metadata?.title],
     ['Author', metadata?.author],
     ['Subject', metadata?.subject],
@@ -9150,6 +9446,17 @@ function ocrDetectionLabel(detection: Partial<OcrDetectionResult> | null | undef
     default:
       return 'OCR status unknown'
   }
+}
+
+function ocrTextPagesStatus(
+  detection: Partial<OcrDetectionResult> | null | undefined,
+  ocrTextPages: number,
+) {
+  return ocrTextPages > 0 ? `OCR Text: ${ocrTextPages} page${ocrTextPages === 1 ? '' : 's'}` : ocrDetectionLabel(detection)
+}
+
+function searchMatchSourceLabel(match: SearchMatch | undefined) {
+  return match?.source === 'ocr' ? ' - OCR Text' : ''
 }
 
 function countMeaningfulTextCharacters(text: string) {

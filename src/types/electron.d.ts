@@ -32,6 +32,18 @@ type OcrDetectionResult = {
   error?: string
 }
 
+type OcrLanguage = 'eng' | 'ben' | 'ara' | 'hin' | 'urd' | 'fra' | 'deu' | 'spa'
+
+type PageOcrResult = {
+  pageNumber: number
+  text: string
+  confidence: number
+  language: OcrLanguage
+  createdAt: string
+  status: 'complete' | 'failed'
+  error?: string
+}
+
 type OpenedPdf = {
   id: string
   name: string
@@ -308,6 +320,21 @@ declare global {
       revealPdf: (id: string) => Promise<void>
       savePdfState: (id: string, state: PdfReadingState) => Promise<void>
       saveOcrDetection: (id: string, detection: OcrDetectionResult) => Promise<OcrDetectionResult>
+      listPageOcrResults: (documentId: string) => Promise<PageOcrResult[]>
+      runPageOcr: (request: {
+        operationId: string
+        documentId: string
+        pageNumber: number
+        language: OcrLanguage
+        imageDataUrl: string
+        force?: boolean
+      }) => Promise<PageOcrResult>
+      cancelPageOcr: (operationId: string) => Promise<void>
+      onPageOcrProgress: (callback: (progress: {
+        operationId: string
+        status: string
+        progress: number
+      }) => void) => () => void
       savePdfHighlights: (
         identity: { id: string; fileSize: number; modifiedAt: number },
         highlights: PdfHighlight[],

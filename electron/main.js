@@ -1,9 +1,11 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, screen, shell } from 'electron'
 import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { degrees, PDFDocument, rgb, StandardFonts } from 'pdf-lib'
+import { createWorker, OEM, PSM } from 'tesseract.js'
 import { GlobalSearchIndex } from './search-index.js'
 import {
   buildBibliography,
@@ -22,11 +24,24 @@ import {
 } from './references.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const require = createRequire(import.meta.url)
 const appDataRoot = process.env.NEXT_PDF_VIEWER_DATA_DIR
   ? path.resolve(process.env.NEXT_PDF_VIEWER_DATA_DIR)
   : app.isPackaged
     ? path.join(app.getPath('appData'), 'Next PDF Viewer')
     : path.join(process.cwd(), '.electron-data')
+
+const OCR_LANGUAGE_DATA = {
+  eng: require('@tesseract.js-data/eng'),
+  ben: require('@tesseract.js-data/ben'),
+  ara: require('@tesseract.js-data/ara'),
+  hin: require('@tesseract.js-data/hin'),
+  urd: require('@tesseract.js-data/urd'),
+  fra: require('@tesseract.js-data/fra'),
+  deu: require('@tesseract.js-data/deu'),
+  spa: require('@tesseract.js-data/spa'),
+}
+const activeOcrJobs = new Map()
 
 app.setPath('userData', path.join(appDataRoot, 'user-data'))
 app.setPath('logs', path.join(appDataRoot, 'logs'))
@@ -58,6 +73,7 @@ function emptyStore() {
     documentRegistry: {},
     documentStates: {},
     highlightDocuments: {},
+    ocrDocuments: {},
     signaturePlacementDocuments: {},
     fillSignDocuments: {},
     highlightLibraryIndex: {},
@@ -663,6 +679,44 @@ function sanitizeOcrDetection(detection) {
     detectedAt: detection?.detectedAt ? validIsoDate(detection.detectedAt) : null,
     error: typeof detection?.error === 'string' ? detection.error.slice(0, 500) : '',
   }
+}
+
+function sanitizeOcrLanguage(language) {
+  return Object.hasOwn(OCR_LANGUAGE_DATA, language) ? language : 'eng'
+}
+
+function getOcrResultKey(pageNumber, language) {
+  return `${Math.max(1, Math.trunc(Number(pageNumber) || 1))}:${sanitizeOcrLanguage(language)}`
+}
+
+function sanitizePageOcrResult(result) {
+  if (!result || typeof result !== 'object') return null
+  const pageNumber = Math.max(1, Math.trunc(Number(result.pageNumber) || 1))
+  const language = sanitizeOcrLanguage(result.language)
+  const status = result.status === 'failed' ? 'failed' : 'complete'
+  const createdAt = validIsoDate(result.createdAt) ?? new Date().toISOString()
+  return {
+    pageNumber,
+    text: String(result.text ?? '').slice(0, 2_000_000),
+    confidence: Math.min(100, Math.max(0, Number(result.confidence) || 0)),
+    language,
+    createdAt,
+    status,
+    error: typeof result.error === 'string' ? result.error.slice(0, 1000) : '',
+  }
+}
+
+function getStoredOcrResults(store, documentId) {
+  const document = store.ocrDocuments?.[documentId]
+  if (!document || typeof document !== 'object') return []
+  return Object.values(document.pages ?? {})
+    .map(sanitizePageOcrResult)
+    .filter(Boolean)
+    .sort((left, right) => left.pageNumber - right.pageNumber || left.language.localeCompare(right.language))
+}
+
+function resolveUnpackedPath(resourcePath) {
+  return app.isPackaged ? resourcePath.replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`) : resourcePath
 }
 
 function validIsoDate(value) {
@@ -3496,6 +3550,129 @@ ipcMain.handle('pdf:save-ocr-detection', (_event, id, detection) =>
     return sanitizedDetection
   }),
 )
+
+ipcMain.handle('ocr:list-page-results', (_event, documentId) =>
+  withStore((store) => getStoredOcrResults(store, String(documentId ?? ''))),
+)
+
+ipcMain.handle('ocr:cancel-page', async (_event, operationId) => {
+  const job = activeOcrJobs.get(operationId)
+  if (!job) return
+  job.cancelled = true
+  activeOcrJobs.delete(operationId)
+  await job.worker?.terminate().catch(() => undefined)
+})
+
+ipcMain.handle('ocr:run-page', async (event, request) => {
+  const operationId = String(request?.operationId ?? randomUUID()).slice(0, 120)
+  const documentId = String(request?.documentId ?? '').slice(0, 128)
+  const pageNumber = Math.max(1, Math.trunc(Number(request?.pageNumber) || 1))
+  const language = sanitizeOcrLanguage(request?.language)
+  const force = request?.force === true
+  const resultKey = getOcrResultKey(pageNumber, language)
+
+  if (!documentId) throw new Error('No PDF document is selected for OCR.')
+  if (typeof request?.imageDataUrl !== 'string' || !request.imageDataUrl.startsWith('data:image/png;base64,')) {
+    throw new Error('OCR requires a rendered PNG image of the current page.')
+  }
+
+  const cachedResult = await withStore((store) =>
+    sanitizePageOcrResult(store.ocrDocuments?.[documentId]?.pages?.[resultKey]),
+  )
+  if (cachedResult?.status === 'complete' && !force) {
+    return cachedResult
+  }
+
+  const languageData = OCR_LANGUAGE_DATA[language]
+  const langPath = resolveUnpackedPath(languageData.langPath)
+  const cachePath = path.join(app.getPath('userData'), 'ocr-cache')
+  await fs.mkdir(cachePath, { recursive: true })
+
+  const imageBuffer = Buffer.from(request.imageDataUrl.replace(/^data:image\/png;base64,/, ''), 'base64')
+  let worker = null
+  let activeJob = null
+  const sendProgress = (status, progress) => {
+    if (!event.sender.isDestroyed()) {
+      event.sender.send('ocr:page-progress', {
+        operationId,
+        status,
+        progress: Math.min(1, Math.max(0, Number(progress) || 0)),
+      })
+    }
+  }
+
+  try {
+    sendProgress('starting OCR worker', 0)
+    worker = await createWorker(language, OEM.LSTM_ONLY, {
+      langPath,
+      cachePath,
+      gzip: languageData.gzip !== false,
+      logger: (message) => sendProgress(message.status, message.progress),
+    })
+    activeJob = { worker, cancelled: false }
+    activeOcrJobs.set(operationId, activeJob)
+    await worker.setParameters({
+      tessedit_pageseg_mode: PSM.AUTO,
+      preserve_interword_spaces: '1',
+      user_defined_dpi: '220',
+    })
+    sendProgress(`OCR running on page ${pageNumber}`, 0.1)
+    const recognized = await worker.recognize(imageBuffer)
+    if (activeJob.cancelled) {
+      throw new Error('OCR cancelled.')
+    }
+    const createdAt = new Date().toISOString()
+    const result = sanitizePageOcrResult({
+      pageNumber,
+      text: recognized.data.text,
+      confidence: recognized.data.confidence,
+      language,
+      createdAt,
+      status: 'complete',
+    })
+    await withStore(async (store) => {
+      store.ocrDocuments ??= {}
+      store.ocrDocuments[documentId] ??= { pages: {} }
+      store.ocrDocuments[documentId].pages[resultKey] = result
+      const record = store.documentRegistry[documentId] ?? store.recentFiles.find((item) => item.id === documentId)
+      if (record) {
+        record.ocrDetection = sanitizeOcrDetection({
+          ...(record.ocrDetection ?? {}),
+          status: 'ocr-recommended',
+          detectedAt: createdAt,
+        })
+        store.documentRegistry[documentId] = record
+        store.recentFiles = store.recentFiles.map((item) =>
+          item.id === documentId ? { ...item, ocrDetection: record.ocrDetection } : item,
+        )
+      }
+      await saveStore(store)
+    })
+    sendProgress('OCR complete', 1)
+    return result
+  } catch (error) {
+    const createdAt = new Date().toISOString()
+    const result = sanitizePageOcrResult({
+      pageNumber,
+      text: '',
+      confidence: 0,
+      language,
+      createdAt,
+      status: 'failed',
+      error: error instanceof Error ? error.message : String(error),
+    })
+    await withStore(async (store) => {
+      store.ocrDocuments ??= {}
+      store.ocrDocuments[documentId] ??= { pages: {} }
+      store.ocrDocuments[documentId].pages[resultKey] = result
+      await saveStore(store)
+    })
+    throw error
+  } finally {
+    activeOcrJobs.delete(operationId)
+    await worker?.terminate().catch(() => undefined)
+  }
+})
 
 ipcMain.handle('pdf:save-highlights', (_event, identity, highlights) =>
   withStore(async (store) => {
