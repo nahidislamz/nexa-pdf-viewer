@@ -734,6 +734,134 @@ function sanitizeOcrTextItems(items) {
     : []
 }
 
+function extractOcrLayoutItems(page) {
+  const directWords = sanitizeOcrTextItems(page?.words)
+  const directLines = sanitizeOcrTextItems(page?.lines)
+  if (directWords.length > 0 || directLines.length > 0) {
+    return { words: directWords, lines: directLines }
+  }
+
+  const words = []
+  const lines = []
+  for (const block of Array.isArray(page?.blocks) ? page.blocks : []) {
+    for (const paragraph of Array.isArray(block?.paragraphs) ? block.paragraphs : []) {
+      for (const line of Array.isArray(paragraph?.lines) ? paragraph.lines : []) {
+        const lineItem = ocrLayoutItemFromBbox(line)
+        if (lineItem) lines.push(lineItem)
+        for (const word of Array.isArray(line?.words) ? line.words : []) {
+          const wordItem = ocrLayoutItemFromBbox(word)
+          if (wordItem) words.push(wordItem)
+        }
+      }
+    }
+  }
+
+  if ((words.length === 0 || lines.length === 0) && typeof page?.tsv === 'string') {
+    const tsvItems = extractOcrLayoutItemsFromTsv(page.tsv)
+    return {
+      words: words.length > 0 ? words : tsvItems.words,
+      lines: lines.length > 0 ? lines : tsvItems.lines,
+    }
+  }
+
+  return {
+    words: sanitizeOcrTextItems(words),
+    lines: sanitizeOcrTextItems(lines),
+  }
+}
+
+function ocrLayoutItemFromBbox(item) {
+  const text = String(item?.text ?? '').trim()
+  const bbox = item?.bbox
+  if (!text || !bbox) return null
+  return {
+    text,
+    confidence: Math.min(100, Math.max(0, Number(item.confidence) || 0)),
+    x0: Math.max(0, Number(bbox.x0) || 0),
+    y0: Math.max(0, Number(bbox.y0) || 0),
+    x1: Math.max(0, Number(bbox.x1) || 0),
+    y1: Math.max(0, Number(bbox.y1) || 0),
+  }
+}
+
+function extractOcrLayoutItemsFromTsv(tsv) {
+  const words = []
+  const lineGroups = new Map()
+  const rows = String(tsv).split(/\r?\n/).filter(Boolean)
+  const header = rows.shift()?.split('\t') ?? []
+  const column = (name) => header.indexOf(name)
+  const indexes = {
+    level: column('level'),
+    page: column('page_num'),
+    block: column('block_num'),
+    paragraph: column('par_num'),
+    line: column('line_num'),
+    left: column('left'),
+    top: column('top'),
+    width: column('width'),
+    height: column('height'),
+    confidence: column('conf'),
+    text: column('text'),
+  }
+  if (Object.values(indexes).some((index) => index < 0)) {
+    return { words: [], lines: [] }
+  }
+  for (const row of rows) {
+    const cells = row.split('\t')
+    if (cells[indexes.level] !== '5') continue
+    const text = String(cells[indexes.text] ?? '').trim()
+    if (!text) continue
+    const left = Math.max(0, Number(cells[indexes.left]) || 0)
+    const top = Math.max(0, Number(cells[indexes.top]) || 0)
+    const width = Math.max(0, Number(cells[indexes.width]) || 0)
+    const height = Math.max(0, Number(cells[indexes.height]) || 0)
+    if (width <= 0 || height <= 0) continue
+    const item = {
+      text,
+      confidence: Math.min(100, Math.max(0, Number(cells[indexes.confidence]) || 0)),
+      x0: left,
+      y0: top,
+      x1: left + width,
+      y1: top + height,
+    }
+    words.push(item)
+    const lineKey = [
+      cells[indexes.page],
+      cells[indexes.block],
+      cells[indexes.paragraph],
+      cells[indexes.line],
+    ].join(':')
+    const group = lineGroups.get(lineKey) ?? {
+      text: '',
+      confidenceTotal: 0,
+      confidenceCount: 0,
+      x0: item.x0,
+      y0: item.y0,
+      x1: item.x1,
+      y1: item.y1,
+    }
+    group.text = group.text ? `${group.text} ${text}` : text
+    group.confidenceTotal += item.confidence
+    group.confidenceCount += 1
+    group.x0 = Math.min(group.x0, item.x0)
+    group.y0 = Math.min(group.y0, item.y0)
+    group.x1 = Math.max(group.x1, item.x1)
+    group.y1 = Math.max(group.y1, item.y1)
+    lineGroups.set(lineKey, group)
+  }
+  return {
+    words: sanitizeOcrTextItems(words),
+    lines: sanitizeOcrTextItems([...lineGroups.values()].map((group) => ({
+      text: group.text,
+      confidence: group.confidenceCount ? group.confidenceTotal / group.confidenceCount : 0,
+      x0: group.x0,
+      y0: group.y0,
+      x1: group.x1,
+      y1: group.y1,
+    }))),
+  }
+}
+
 function getStoredOcrResults(store, documentId) {
   const document = store.ocrDocuments?.[documentId]
   if (!document || typeof document !== 'object') return []
@@ -3947,6 +4075,11 @@ ipcMain.handle('ocr:run-page', async (event, request) => {
   if (typeof request?.imageDataUrl !== 'string' || !request.imageDataUrl.startsWith('data:image/png;base64,')) {
     throw new Error('OCR requires a rendered PNG image of the current page.')
   }
+  const imageWidth = Math.max(0, Math.trunc(Number(request?.imageWidth) || 0))
+  const imageHeight = Math.max(0, Math.trunc(Number(request?.imageHeight) || 0))
+  if (imageWidth <= 0 || imageHeight <= 0) {
+    throw new Error('OCR requires a rendered page image with a valid size.')
+  }
 
   const cachedResult = await withStore((store) =>
     sanitizePageOcrResult(store.ocrDocuments?.[documentId]?.pages?.[resultKey]),
@@ -3957,30 +4090,49 @@ ipcMain.handle('ocr:run-page', async (event, request) => {
 
   const languageData = OCR_LANGUAGE_DATA[language]
   const langPath = resolveUnpackedPath(languageData.langPath)
+  const trainedDataPath = path.join(langPath, `${language}.traineddata${languageData.gzip === false ? '' : '.gz'}`)
+  await fs.access(trainedDataPath).catch(() => {
+    throw new Error(`OCR language data is missing for ${language}: ${trainedDataPath}`)
+  })
   const cachePath = path.join(app.getPath('userData'), 'ocr-cache')
   await fs.mkdir(cachePath, { recursive: true })
 
   const imageBuffer = Buffer.from(request.imageDataUrl.replace(/^data:image\/png;base64,/, ''), 'base64')
+  if (imageBuffer.length < 100) {
+    throw new Error('OCR received an invalid rendered page image.')
+  }
   let worker = null
   let activeJob = null
-  const sendProgress = (status, progress) => {
+  const sendProgress = (status, progress, debug = undefined) => {
+    if (debug) {
+      console.info('[OCR]', status, debug)
+    }
     if (!event.sender.isDestroyed()) {
       event.sender.send('ocr:page-progress', {
         operationId,
         status,
         progress: Math.min(1, Math.max(0, Number(progress) || 0)),
+        debug,
       })
     }
   }
 
   try {
-    sendProgress('starting OCR worker', 0)
+    sendProgress('starting OCR worker', 0, {
+      pageNumber,
+      language,
+      langPath,
+      imageWidth,
+      imageHeight,
+      imageBytes: imageBuffer.length,
+    })
     worker = await createWorker(language, OEM.LSTM_ONLY, {
       langPath,
       cachePath,
       gzip: languageData.gzip !== false,
       logger: (message) => sendProgress(message.status, message.progress),
     })
+    sendProgress('OCR worker ready', 0.05, { language })
     activeJob = { worker, cancelled: false }
     activeOcrJobs.set(operationId, activeJob)
     await worker.setParameters({
@@ -3988,10 +4140,38 @@ ipcMain.handle('ocr:run-page', async (event, request) => {
       preserve_interword_spaces: '1',
       user_defined_dpi: '220',
     })
-    sendProgress(`OCR running on page ${pageNumber}`, 0.1)
-    const recognized = await worker.recognize(imageBuffer)
+    sendProgress(`OCR running on page ${pageNumber}`, 0.1, { pageNumber, imageWidth, imageHeight })
+    let recognized = await worker.recognize(imageBuffer, {}, { text: true, blocks: true, tsv: true })
     if (activeJob.cancelled) {
       throw new Error('OCR cancelled.')
+    }
+    let recognizedText = String(recognized?.data?.text ?? '').trim()
+    if (!recognizedText) {
+      sendProgress('OCR retrying with sparse text mode', 0.65, { pageNumber, language })
+      await worker.setParameters({
+        tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+        preserve_interword_spaces: '1',
+        user_defined_dpi: '220',
+      })
+      recognized = await worker.recognize(imageBuffer, {}, { text: true, blocks: true, tsv: true })
+      if (activeJob.cancelled) {
+        throw new Error('OCR cancelled.')
+      }
+      recognizedText = String(recognized?.data?.text ?? '').trim()
+    }
+    const { words: recognizedWords, lines: recognizedLines } = extractOcrLayoutItems(recognized?.data)
+    const confidence = Math.min(100, Math.max(0, Number(recognized?.data?.confidence) || 0))
+    sendProgress('OCR worker complete', 0.95, {
+      pageNumber,
+      language,
+      textLength: recognizedText.length,
+      firstText: recognizedText.slice(0, 200),
+      confidence,
+      wordCount: recognizedWords.length,
+      lineCount: recognizedLines.length,
+    })
+    if (!recognizedText) {
+      throw new Error('OCR completed but no text was detected.')
     }
     const createdAt = new Date().toISOString()
     const previousResult = await withStore((store) =>
@@ -3999,13 +4179,13 @@ ipcMain.handle('ocr:run-page', async (event, request) => {
     )
     const result = sanitizePageOcrResult({
       pageNumber,
-      text: recognized.data.text,
-      confidence: recognized.data.confidence,
-      imageWidth: request.imageWidth,
-      imageHeight: request.imageHeight,
+      text: recognizedText,
+      confidence,
+      imageWidth,
+      imageHeight,
       pageRotation: request.pageRotation,
-      words: recognized.data.words,
-      lines: recognized.data.lines,
+      words: recognizedWords,
+      lines: recognizedLines,
       language,
       createdAt: previousResult?.createdAt ?? createdAt,
       updatedAt: createdAt,
@@ -4029,16 +4209,23 @@ ipcMain.handle('ocr:run-page', async (event, request) => {
       }
       await saveStore(store)
     })
-    sendProgress('OCR complete', 1)
+    console.info('[OCR] result text sample:', recognizedText.slice(0, 200))
+    sendProgress('OCR complete', 1, {
+      textLength: result.text.length,
+      confidence: result.confidence,
+      wordCount: result.words.length,
+      lineCount: result.lines.length,
+    })
     return result
   } catch (error) {
     const createdAt = new Date().toISOString()
+    const errorMessage = error instanceof Error ? error.message : String(error)
     const result = sanitizePageOcrResult({
       pageNumber,
       text: '',
       confidence: 0,
-      imageWidth: request?.imageWidth,
-      imageHeight: request?.imageHeight,
+      imageWidth,
+      imageHeight,
       pageRotation: request?.pageRotation,
       words: [],
       lines: [],
@@ -4047,14 +4234,31 @@ ipcMain.handle('ocr:run-page', async (event, request) => {
       updatedAt: createdAt,
       status: 'failed',
       lowConfidence: true,
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage,
     })
-    await withStore(async (store) => {
-      store.ocrDocuments ??= {}
-      store.ocrDocuments[documentId] ??= { pages: {} }
-      store.ocrDocuments[documentId].pages[resultKey] = result
-      await saveStore(store)
+    console.warn('[OCR] failed:', errorMessage, {
+      pageNumber,
+      language,
+      imageWidth,
+      imageHeight,
+      imageBytes: imageBuffer.length,
     })
+    sendProgress(errorMessage, 1, {
+      pageNumber,
+      language,
+      textLength: 0,
+      confidence: 0,
+      wordCount: 0,
+      lineCount: 0,
+    })
+    if (errorMessage !== 'OCR completed but no text was detected.') {
+      await withStore(async (store) => {
+        store.ocrDocuments ??= {}
+        store.ocrDocuments[documentId] ??= { pages: {} }
+        store.ocrDocuments[documentId].pages[resultKey] = result
+        await saveStore(store)
+      })
+    }
     throw error
   } finally {
     activeOcrJobs.delete(operationId)

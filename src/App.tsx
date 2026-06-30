@@ -1502,6 +1502,9 @@ function App() {
 
   useEffect(() => {
     return window.electronAPI.onPageOcrProgress((progress) => {
+      if (progress.debug) {
+        console.info('[OCR]', progress.status, progress.debug)
+      }
       setOcrJob((current) => {
         if (!current) return current
         const batchOperationId = progress.operationId.split(':page:')[0]
@@ -5459,9 +5462,17 @@ function App() {
       viewport,
       background: '#ffffff',
     }).promise
+    const imageDataUrl = canvas.toDataURL('image/png')
+    console.info('[OCR] rendered page image', {
+      pageNumber,
+      imageWidth: canvas.width,
+      imageHeight: canvas.height,
+      pageRotation,
+      dataUrlLength: imageDataUrl.length,
+    })
     return {
       pageNumber,
-      imageDataUrl: canvas.toDataURL('image/png'),
+      imageDataUrl,
       imageWidth: canvas.width,
       imageHeight: canvas.height,
       pageRotation,
@@ -5491,6 +5502,7 @@ function App() {
     const operationId = crypto.randomUUID()
     const startedAt = performance.now()
     const failedPageNumbers: number[] = []
+    const failedPageMessages = new Map<number, string>()
     let completedPages = 0
     ocrBatchCancelRef.current = false
     ocrBatchPausedRef.current = false
@@ -5571,6 +5583,7 @@ function App() {
       } catch (error) {
         if (!ocrBatchCancelRef.current && !cancelledOcrOperationsRef.current.has(pageOperationId)) {
           failedPageNumbers.push(pageNumber)
+          failedPageMessages.set(pageNumber, getErrorMessage(error))
           console.warn(`OCR failed on page ${pageNumber}:`, getErrorMessage(error))
         }
         cancelledOcrOperationsRef.current.delete(pageOperationId)
@@ -5599,7 +5612,8 @@ function App() {
       setLoadingProgress('OCR cancelled')
       window.setTimeout(() => setLoadingProgress(null), 1500)
     } else if (failedPageNumbers.length > 0) {
-      setErrorMessage(`OCR finished with failed pages: ${formatPageList(failedPageNumbers)}`)
+      const singlePageError = pages.length === 1 ? failedPageMessages.get(pages[0]) : ''
+      setErrorMessage(singlePageError || `OCR finished with failed pages: ${formatPageList(failedPageNumbers)}`)
       setLoadingProgress(null)
     } else {
       setLoadingProgress('OCR complete')

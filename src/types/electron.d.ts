@@ -375,6 +375,7 @@ declare global {
         operationId: string
         status: string
         progress: number
+        debug?: Record<string, unknown>
       }) => void) => () => void
       savePdfHighlights: (
         identity: { id: string; fileSize: number; modifiedAt: number },
