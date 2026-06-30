@@ -4003,6 +4003,10 @@ ipcMain.handle('search:index-pages', (_event, documentId, pages) =>
   globalSearchIndex.appendPages(documentId, pages),
 )
 
+ipcMain.handle('search:index-ocr-pages', (_event, documentId, pages) =>
+  globalSearchIndex.upsertOcrPages(documentId, pages),
+)
+
 ipcMain.handle('search:index-complete', (_event, documentId) =>
   globalSearchIndex.completeDocument(documentId),
 )

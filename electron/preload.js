@@ -110,6 +110,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startSearchIndex: (payload) => ipcRenderer.invoke('search:index-start', payload),
   appendSearchIndexPages: (documentId, pages) =>
     ipcRenderer.invoke('search:index-pages', documentId, pages),
+  appendOcrSearchIndexPages: (documentId, pages) =>
+    ipcRenderer.invoke('search:index-ocr-pages', documentId, pages),
   completeSearchIndex: (documentId) => ipcRenderer.invoke('search:index-complete', documentId),
   cancelSearchIndex: (documentId) => ipcRenderer.invoke('search:index-cancel', documentId),
   searchLibrary: (request) => ipcRenderer.invoke('search:query', request),

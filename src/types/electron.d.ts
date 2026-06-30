@@ -372,6 +372,7 @@ declare global {
       getSearchIndexStatus: (identity: { id: string; fileSize: number; modifiedAt: number }) => Promise<{ current: boolean; status: 'pending' | 'complete'; indexedPages: number; totalPages: number }>
       startSearchIndex: (payload: { id: string; name: string; filePath: string; fileSize: number; modifiedAt: number; totalPages: number; metadata: Record<string, string>; bookmarks: Array<{ title: string; pageNumber: number }> }) => Promise<{ accepted: boolean }>
       appendSearchIndexPages: (documentId: string, pages: Array<{ pageNumber: number; text: string }>) => Promise<{ accepted: boolean; indexedPages?: number }>
+      appendOcrSearchIndexPages: (documentId: string, pages: Array<{ pageNumber: number; text: string }>) => Promise<{ accepted: boolean; indexedPages?: number }>
       completeSearchIndex: (documentId: string) => Promise<{ indexedPages: number; totalPages: number }>
       cancelSearchIndex: (documentId: string) => Promise<void>
       searchLibrary: (request: { query: string; filters: GlobalSearchFilters }) => Promise<GlobalSearchResponse>

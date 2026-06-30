@@ -312,6 +312,38 @@ export class GlobalSearchIndex {
     })
   }
 
+  upsertOcrPages(documentId, pages) {
+    return this.enqueue(async () => {
+      const id = String(documentId ?? '')
+      const existing = this.documents.get(id)
+      if (!existing) return { accepted: false, indexedPages: 0 }
+
+      const pagesByNumber = new Map(existing.pages.map((page) => [page.pageNumber, page]))
+      for (const page of Array.isArray(pages) ? pages.slice(0, 200) : []) {
+        const pageNumber = Math.max(1, Math.trunc(Number(page?.pageNumber) || 0))
+        const text = typeof page?.text === 'string' ? page.text.slice(0, 1_000_000).trim() : ''
+        if (!pageNumber || !text) continue
+        const current = pagesByNumber.get(pageNumber)
+        pagesByNumber.set(pageNumber, {
+          pageNumber,
+          text: current?.text ? `${current.text}\n\n${text}` : text,
+        })
+      }
+
+      const document = sanitizeSearchDocument({
+        ...existing,
+        status: existing.status === 'complete' ? 'complete' : 'pending',
+        pages: [...pagesByNumber.values()].sort((left, right) => left.pageNumber - right.pageNumber),
+        indexedAt: new Date().toISOString(),
+      })
+      this.documents.set(id, document)
+      this.rebuildDocumentRecords(document)
+      await this.persistDocument(document)
+      await this.persistManifest()
+      return { accepted: true, indexedPages: document.pages.length }
+    })
+  }
+
   completeDocument(documentId) {
     return this.enqueue(async () => {
       const session = this.sessions.get(String(documentId ?? ''))

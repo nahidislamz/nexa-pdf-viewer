@@ -238,6 +238,20 @@ type PageOcrResult = {
   error?: string
 }
 
+type OcrJobState = {
+  operationId: string
+  pageNumber: number
+  status: string
+  progress: number
+  totalPages: number
+  completedPages: number
+  failedPages: number
+  failedPageNumbers: number[]
+  startedAt: number
+  estimatedRemainingMs: number | null
+  paused: boolean
+}
+
 type SearchProgress = {
   processed: number
   total: number
@@ -424,16 +438,14 @@ function App() {
   const [documentMetadata, setDocumentMetadata] = useState<DocumentMetadata | null>(null)
   const [metadataLoading, setMetadataLoading] = useState(false)
   const [ocrDetection, setOcrDetection] = useState<OcrDetectionResult>(EMPTY_OCR_DETECTION)
-  const [ocrLanguage, setOcrLanguage] = useState<OcrLanguage>('eng')
+  const [ocrLanguage, setOcrLanguage] = useState<OcrLanguage>(() =>
+    sanitizeOcrLanguage(window.localStorage.getItem('next-pdf-viewer:ocr-language')),
+  )
+  const [ocrPageRangeInput, setOcrPageRangeInput] = useState('')
   const [pageOcrResults, setPageOcrResults] = useState<PageOcrResult[]>([])
   const [currentPageTextStatus, setCurrentPageTextStatus] =
     useState<'unknown' | 'searchable' | 'empty'>('unknown')
-  const [ocrJob, setOcrJob] = useState<{
-    operationId: string
-    pageNumber: number
-    status: string
-    progress: number
-  } | null>(null)
+  const [ocrJob, setOcrJob] = useState<OcrJobState | null>(null)
   const [highlights, setHighlights] = useState<PdfHighlight[]>([])
   const [signaturePlacements, setSignaturePlacements] = useState<SignaturePlacement[]>([])
   const [fillSignFields, setFillSignFields] = useState<FillSignField[]>([])
@@ -519,6 +531,9 @@ function App() {
   const metadataGenerationRef = useRef(0)
   const ocrDetectionGenerationRef = useRef(0)
   const cancelledOcrOperationsRef = useRef(new Set<string>())
+  const ocrBatchCancelRef = useRef(false)
+  const ocrBatchPausedRef = useRef(false)
+  const activeOcrOperationRef = useRef<string | null>(null)
   const firstPageProxyRef = useRef<PDFPageProxy | null>(null)
   const pdfDocumentRef = useRef<PDFDocumentProxy | null>(null)
   const navigationTargetRef = useRef<number | null>(null)
@@ -678,6 +693,15 @@ function App() {
           result.status === 'complete',
       ) ?? null,
     [currentPage, ocrLanguage, pageOcrResults],
+  )
+  const pageOcrResultKeys = useMemo(
+    () =>
+      new Set(
+        pageOcrResults
+          .filter((result) => result.status === 'complete' && result.text.trim())
+          .map((result) => `${result.pageNumber}:${result.language}`),
+      ),
+    [pageOcrResults],
   )
   const ocrTextPageCount = useMemo(
     () => new Set(pageOcrResults.filter((result) => result.status === 'complete' && result.text.trim()).map((result) => result.pageNumber)).size,
@@ -1448,17 +1472,27 @@ function App() {
 
   useEffect(() => {
     return window.electronAPI.onPageOcrProgress((progress) => {
-      setOcrJob((current) =>
-        current?.operationId === progress.operationId
-          ? {
-              ...current,
-              status: progress.status,
-              progress: progress.progress,
-            }
-          : current,
-      )
+      setOcrJob((current) => {
+        if (!current) return current
+        const batchOperationId = progress.operationId.split(':page:')[0]
+        if (
+          current.operationId !== progress.operationId &&
+          current.operationId !== batchOperationId
+        ) {
+          return current
+        }
+        return {
+          ...current,
+          status: progress.status,
+          progress: progress.progress,
+        }
+      })
     })
   }, [])
+
+  useEffect(() => {
+    window.localStorage.setItem('next-pdf-viewer:ocr-language', ocrLanguage)
+  }, [ocrLanguage])
 
   useEffect(() => {
     if (!pdfDocument || !pdfFile) {
@@ -5348,9 +5382,8 @@ function App() {
     closeToolbarMenu()
   }
 
-  async function renderCurrentPageForOcr() {
+  async function renderPageForOcr(pageNumber: number) {
     if (!pdfDocument) throw new Error('No PDF is open.')
-    const pageNumber = currentPageRef.current
     const page = await pdfDocument.getPage(pageNumber)
     const viewport = page.getViewport({
       scale: 2.5,
@@ -5373,7 +5406,7 @@ function App() {
     }
   }
 
-  async function runCurrentPageOcr(force = false) {
+  async function runOcrPages(requestedPages: number[], force = false) {
     closeToolbarMenu()
     if (!pdfDocument || !pdfFile) {
       setErrorMessage('Open a PDF before running OCR.')
@@ -5383,74 +5416,160 @@ function App() {
       setErrorMessage('OCR Current Page is available from the left pane in this pass.')
       return
     }
-    if (currentPageOcrResult && !force) {
-      setLoadingProgress('OCR already completed for this page. Choose Run OCR Again to replace it.')
+    const pages = normalizeOcrPageList(requestedPages, numPages).filter((pageNumber) =>
+      force ? true : !pageOcrResultKeys.has(`${pageNumber}:${ocrLanguage}`),
+    )
+    if (pages.length === 0) {
+      setLoadingProgress('OCR already completed for the selected pages. Choose Run OCR Again to replace cached OCR text.')
       window.setTimeout(() => setLoadingProgress(null), 2600)
       return
     }
 
     setErrorMessage(null)
     const operationId = crypto.randomUUID()
-    const pageNumber = currentPageRef.current
+    const startedAt = performance.now()
+    const failedPageNumbers: number[] = []
+    let completedPages = 0
+    ocrBatchCancelRef.current = false
+    ocrBatchPausedRef.current = false
     setOcrJob({
       operationId,
-      pageNumber,
-      status: `OCR running on page ${pageNumber}`,
+      pageNumber: pages[0],
+      status: `OCR page ${pages[0]} of ${numPages}`,
       progress: 0,
+      totalPages: pages.length,
+      completedPages: 0,
+      failedPages: 0,
+      failedPageNumbers,
+      startedAt,
+      estimatedRemainingMs: null,
+      paused: false,
     })
-    setLoadingProgress(`OCR running on page ${pageNumber}`)
+    setLoadingProgress(`OCR running on ${pages.length === 1 ? `page ${pages[0]}` : `${pages.length} pages`}`)
 
-    try {
-      const renderedPage = await renderCurrentPageForOcr()
-      const result = await window.electronAPI.runPageOcr({
-        operationId,
-        documentId: pdfFile.id,
-        pageNumber: renderedPage.pageNumber,
-        language: ocrLanguage,
-        imageDataUrl: renderedPage.imageDataUrl,
-        force,
-      })
-      setPageOcrResults((current) => [
-        ...current.filter(
-          (candidate) =>
-            !(
-              candidate.pageNumber === result.pageNumber &&
-              candidate.language === result.language
-            ),
-        ),
-        result,
-      ])
-      setOcrDetection((current) => ({
-        ...current,
-        status: current.status === 'searchable' ? current.status : 'ocr-recommended',
-        detectedAt: new Date().toISOString(),
-      }))
+    for (const [pageIndex, pageNumber] of pages.entries()) {
+      if (ocrBatchCancelRef.current) break
+      while (ocrBatchPausedRef.current && !ocrBatchCancelRef.current) {
+        await delay(250)
+      }
+      if (ocrBatchCancelRef.current) break
+
+      const pageOperationId = `${operationId}:page:${pageNumber}`
+      activeOcrOperationRef.current = pageOperationId
+      setOcrJob((current) => current
+        ? {
+            ...current,
+            pageNumber,
+            status: `OCR page ${pageNumber} of ${numPages}`,
+            progress: pageIndex / pages.length,
+            completedPages,
+            failedPages: failedPageNumbers.length,
+            failedPageNumbers: [...failedPageNumbers],
+            estimatedRemainingMs: estimateRemainingMs(startedAt, completedPages, pages.length),
+          }
+        : current)
+
+      try {
+        const renderedPage = await renderPageForOcr(pageNumber)
+        const result = await window.electronAPI.runPageOcr({
+          operationId: pageOperationId,
+          documentId: pdfFile.id,
+          pageNumber: renderedPage.pageNumber,
+          language: ocrLanguage,
+          imageDataUrl: renderedPage.imageDataUrl,
+          force,
+        })
+        completedPages += 1
+        setPageOcrResults((current) => [
+          ...current.filter(
+            (candidate) =>
+              !(
+                candidate.pageNumber === result.pageNumber &&
+                candidate.language === result.language
+              ),
+          ),
+          result,
+        ])
+        if (result.text.trim()) {
+          await window.electronAPI.appendOcrSearchIndexPages(pdfFile.id, [
+            { pageNumber: result.pageNumber, text: result.text },
+          ]).catch((error) => console.warn('OCR search index update failed:', getErrorMessage(error)))
+        }
+      } catch (error) {
+        if (!ocrBatchCancelRef.current && !cancelledOcrOperationsRef.current.has(pageOperationId)) {
+          failedPageNumbers.push(pageNumber)
+          console.warn(`OCR failed on page ${pageNumber}:`, getErrorMessage(error))
+        }
+        cancelledOcrOperationsRef.current.delete(pageOperationId)
+      }
+      setOcrJob((current) => current
+        ? {
+            ...current,
+            progress: (pageIndex + 1) / pages.length,
+            completedPages,
+            failedPages: failedPageNumbers.length,
+            failedPageNumbers: [...failedPageNumbers],
+            estimatedRemainingMs: estimateRemainingMs(startedAt, completedPages + failedPageNumbers.length, pages.length),
+          }
+        : current)
+      await yieldToMainThread()
+    }
+
+    activeOcrOperationRef.current = null
+    setOcrDetection((current) => ({
+      ...current,
+      status: current.status === 'searchable' ? current.status : 'ocr-recommended',
+      detectedAt: new Date().toISOString(),
+    }))
+    setOcrJob(null)
+    if (ocrBatchCancelRef.current) {
+      setLoadingProgress('OCR cancelled')
+      window.setTimeout(() => setLoadingProgress(null), 1500)
+    } else if (failedPageNumbers.length > 0) {
+      setErrorMessage(`OCR finished with failed pages: ${formatPageList(failedPageNumbers)}`)
+      setLoadingProgress(null)
+    } else {
       setLoadingProgress('OCR complete')
       window.setTimeout(() => setLoadingProgress(null), 2200)
-    } catch (error) {
-      if (cancelledOcrOperationsRef.current.has(operationId)) {
-        cancelledOcrOperationsRef.current.delete(operationId)
-        setLoadingProgress('OCR cancelled')
-        window.setTimeout(() => setLoadingProgress(null), 1500)
-      } else {
-        setErrorMessage(`OCR failed: ${getErrorMessage(error)}`)
-        setLoadingProgress(null)
-      }
-    } finally {
-      setOcrJob(null)
     }
+    ocrBatchCancelRef.current = false
+    ocrBatchPausedRef.current = false
+  }
+
+  async function runCurrentPageOcr(force = false) {
+    await runOcrPages([currentPageRef.current], force)
+  }
+
+  async function runSelectedPagesOcr(force = false) {
+    try {
+      const pages = parsePageRanges(ocrPageRangeInput, numPages)
+      await runOcrPages(pages, force)
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    }
+  }
+
+  async function runEntireDocumentOcr(force = false) {
+    await runOcrPages(Array.from({ length: numPages }, (_, index) => index + 1), force)
   }
 
   async function cancelCurrentPageOcr() {
     if (!ocrJob) return
     try {
-      cancelledOcrOperationsRef.current.add(ocrJob.operationId)
-      await window.electronAPI.cancelPageOcr(ocrJob.operationId)
+      ocrBatchCancelRef.current = true
+      const activeOperationId = activeOcrOperationRef.current ?? ocrJob.operationId
+      cancelledOcrOperationsRef.current.add(activeOperationId)
+      await window.electronAPI.cancelPageOcr(activeOperationId)
       setLoadingProgress(null)
       setOcrJob(null)
     } catch (error) {
       setErrorMessage(`Could not cancel OCR: ${getErrorMessage(error)}`)
     }
+  }
+
+  function toggleOcrPause() {
+    ocrBatchPausedRef.current = !ocrBatchPausedRef.current
+    setOcrJob((current) => current ? { ...current, paused: ocrBatchPausedRef.current } : current)
   }
 
   function startFillSignTool(tool: FillSignTool) {
@@ -6153,6 +6272,9 @@ function App() {
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('images')} icon={<AddRegular className="size-4" />}>Images to PDF</ToolbarMenuItem>
                 <ToolbarMenuItem onClick={() => openPdfToolPanel('signatures')} icon={<SignatureRegular className="size-4" />}>Signature Manager</ToolbarMenuItem>
                 <div className="my-1 border-t border-slate-700" />
+                <p className="px-3 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">
+                  OCR
+                </p>
                 {currentPageOcrResult ? (
                   <>
                     <p className="px-3 py-1 text-xs text-slate-400">
@@ -6188,6 +6310,51 @@ function App() {
                     OCR Current Page
                   </ToolbarMenuItem>
                 )}
+                <div className="mx-2 my-1 rounded-lg border border-slate-700 bg-slate-900 p-2">
+                  <label className="block text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">
+                    Selected Pages
+                  </label>
+                  <input
+                    type="text"
+                    value={ocrPageRangeInput}
+                    onChange={(event) => setOcrPageRangeInput(event.target.value)}
+                    placeholder="1-5,10,20-30"
+                    disabled={Boolean(ocrJob)}
+                    className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-100 outline-none placeholder:text-slate-600 focus:border-blue-400 disabled:opacity-50"
+                  />
+                  <div className="mt-2 grid grid-cols-2 gap-1">
+                    <button
+                      type="button"
+                      disabled={!pdfDocument || !ocrPageRangeInput.trim() || (splitEnabled && activePane === 'right') || Boolean(ocrJob)}
+                      onClick={() => void runSelectedPagesOcr(false)}
+                      className="rounded-md border border-slate-700 px-2 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      OCR Selected
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!pdfDocument || !ocrPageRangeInput.trim() || (splitEnabled && activePane === 'right') || Boolean(ocrJob)}
+                      onClick={() => void runSelectedPagesOcr(true)}
+                      className="rounded-md border border-slate-700 px-2 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Run Again
+                    </button>
+                  </div>
+                </div>
+                <ToolbarMenuItem
+                  disabled={!pdfDocument || (splitEnabled && activePane === 'right') || Boolean(ocrJob)}
+                  onClick={() => void runEntireDocumentOcr(false)}
+                  icon={<DocumentBulletListRegular className="size-4" />}
+                >
+                  OCR Entire Document
+                </ToolbarMenuItem>
+                <ToolbarMenuItem
+                  disabled={!pdfDocument || (splitEnabled && activePane === 'right') || Boolean(ocrJob)}
+                  onClick={() => void runEntireDocumentOcr(true)}
+                  icon={<DocumentBulletListRegular className="size-4" />}
+                >
+                  Run Entire Document Again
+                </ToolbarMenuItem>
                 <label className="mx-2 my-1 flex items-center justify-between gap-3 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-300">
                   <span>OCR Language</span>
                   <select
@@ -7320,6 +7487,14 @@ function App() {
                     ? `${ocrJob.status} (${Math.round(ocrJob.progress * 100)}%)`
                     : loadingProgress}
                 </p>
+                {ocrJob ? (
+                  <p className="mt-0.5 text-xs text-blue-200/75">
+                    {ocrJob.completedPages} / {ocrJob.totalPages} completed
+                    {ocrJob.failedPages > 0 ? ` | ${ocrJob.failedPages} failed` : ''}
+                    {ocrJob.estimatedRemainingMs ? ` | ETA ${formatDurationLong(ocrJob.estimatedRemainingMs)}` : ''}
+                    {ocrJob.paused ? ' | Paused' : ''}
+                  </p>
+                ) : null}
                 {numPages >= 200 && !ocrJob ? (
                   <p className="mt-0.5 text-xs text-blue-200/70">
                     Large document mode is rendering only pages near the viewport.
@@ -7328,13 +7503,22 @@ function App() {
               </div>
             </div>
             {ocrJob ? (
-              <button
-                type="button"
-                onClick={() => void cancelCurrentPageOcr()}
-                className="shrink-0 rounded-lg border border-blue-300/40 px-3 py-1 text-xs font-semibold text-blue-100 hover:bg-blue-500/15"
-              >
-                Cancel
-              </button>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={toggleOcrPause}
+                  className="rounded-lg border border-blue-300/40 px-3 py-1 text-xs font-semibold text-blue-100 hover:bg-blue-500/15"
+                >
+                  {ocrJob.paused ? 'Resume' : 'Pause'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void cancelCurrentPageOcr()}
+                  className="rounded-lg border border-blue-300/40 px-3 py-1 text-xs font-semibold text-blue-100 hover:bg-blue-500/15"
+                >
+                  Cancel
+                </button>
+              </div>
             ) : null}
           </div>
         ) : null}
@@ -8134,6 +8318,12 @@ function App() {
               <>
                 <StatusDivider />
                 <StatusItem>Indexing {searchIndexProgress.indexed} of {searchIndexProgress.total}</StatusItem>
+              </>
+            ) : null}
+            {ocrJob ? (
+              <>
+                <StatusDivider />
+                <StatusItem>OCR {ocrJob.completedPages}/{ocrJob.totalPages} | {ocrJob.failedPages} failed | {Math.round(ocrJob.progress * 100)}%</StatusItem>
               </>
             ) : null}
           </>
@@ -9455,12 +9645,78 @@ function ocrTextPagesStatus(
   return ocrTextPages > 0 ? `OCR Text: ${ocrTextPages} page${ocrTextPages === 1 ? '' : 's'}` : ocrDetectionLabel(detection)
 }
 
+function sanitizeOcrLanguage(language: unknown): OcrLanguage {
+  return OCR_LANGUAGES.some((item) => item.code === language) ? language as OcrLanguage : 'eng'
+}
+
 function searchMatchSourceLabel(match: SearchMatch | undefined) {
   return match?.source === 'ocr' ? ' - OCR Text' : ''
 }
 
 function countMeaningfulTextCharacters(text: string) {
   return Array.from(text.replace(/\s+/g, '')).filter((character) => /[\p{L}\p{N}]/u.test(character)).length
+}
+
+function parsePageRanges(value: string, totalPages: number) {
+  const trimmed = value.trim()
+  if (!trimmed) throw new Error('Enter page numbers or ranges before running OCR.')
+  const pages = new Set<number>()
+  const parts = trimmed.split(',').map((part) => part.trim()).filter(Boolean)
+  if (parts.length === 0) throw new Error('Enter page numbers or ranges before running OCR.')
+
+  for (const part of parts) {
+    const rangeMatch = part.match(/^(\d+)\s*-\s*(\d+)$/)
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1])
+      const end = Number(rangeMatch[2])
+      if (start > end) throw new Error(`Invalid page range: ${part}`)
+      if (start < 1 || end > totalPages) {
+        throw new Error(`Page range ${part} is outside this document. Use 1-${totalPages}.`)
+      }
+      for (let pageNumber = start; pageNumber <= end; pageNumber += 1) pages.add(pageNumber)
+      continue
+    }
+
+    if (!/^\d+$/.test(part)) throw new Error(`Invalid page entry: ${part}`)
+    const pageNumber = Number(part)
+    if (pageNumber < 1 || pageNumber > totalPages) {
+      throw new Error(`Page ${pageNumber} is outside this document. Use 1-${totalPages}.`)
+    }
+    pages.add(pageNumber)
+  }
+
+  return [...pages].sort((left, right) => left - right)
+}
+
+function normalizeOcrPageList(pages: number[], totalPages: number) {
+  return [...new Set(
+    pages
+      .map((pageNumber) => Math.trunc(Number(pageNumber)))
+      .filter((pageNumber) => pageNumber >= 1 && pageNumber <= totalPages),
+  )].sort((left, right) => left - right)
+}
+
+function formatPageList(pages: number[]) {
+  return pages.slice(0, 20).join(', ') + (pages.length > 20 ? `, +${pages.length - 20} more` : '')
+}
+
+function estimateRemainingMs(startedAt: number, processedPages: number, totalPages: number) {
+  if (processedPages <= 0) return null
+  const elapsed = performance.now() - startedAt
+  const remainingPages = Math.max(0, totalPages - processedPages)
+  return remainingPages * (elapsed / processedPages)
+}
+
+function formatDurationLong(duration: number) {
+  const seconds = Math.max(1, Math.round(duration / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const remainder = seconds % 60
+  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`
+}
+
+function delay(duration: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, duration))
 }
 
 async function getPageText(
